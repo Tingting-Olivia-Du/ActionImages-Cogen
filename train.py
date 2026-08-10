@@ -17,10 +17,47 @@ from training.utils import (
     project_action_5d_to_rgb_torch,
     get_plucker_embeddings_torch,
 )
+from training.templates import (
+    ACTION,
+    VISUAL_MODALITIES,
+    assemble,
+    parse_template,
+    plan_segments,
+)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def assert_own_training_package():
+    """Fail loudly if `training` resolved to a DIFFERENT ActionImages checkout.
+
+    The `ttd_train` conda env has an editable install of a distribution also named
+    `actionimages` whose finder maps `training` -> /workspace/ttdu/ActionImages/training.
+    That finder is *appended* to sys.meta_path, so the stdlib PathFinder (which searches
+    sys.path / PYTHONPATH) wins whenever this repo's root is on sys.path -- but if it is
+    not, `import training` silently loads the OTHER repo and every change here is a no-op
+    against a run that looks completely healthy. Turn that into an immediate crash.
+
+    Fix when it fires: run from this directory with
+        export PYTHONPATH=<this repo root>
+    `cd` alone is not enough under torchrun (runpy does not prepend the script's dir to
+    sys.path); `cd` is separately required because ModelConfig uses the relative
+    local_model_path="checkpoints".
+    """
+    import training
+
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    want = os.path.realpath(os.path.join(repo_root, "training"))
+    got = os.path.realpath(os.path.dirname(training.__file__))
+    if got != want:
+        raise RuntimeError(
+            f"'training' resolved to {got}, not this repo's {want}. An editable install of "
+            f"'actionimages' shadows it. Run:  cd {repo_root} && export PYTHONPATH={repo_root}"
+        )
+    logger.info(f"training package: {got}")
+    return got
 
 
 class MinimalConfig:
@@ -217,6 +254,26 @@ class ActionImagesModel(nn.Module):
         intrinsics_c2w = intrinsics_c2w.to(dtype=self.pipe.torch_dtype, device=device)
         return text, video, camera, action_7d, extrinsics_c2w, intrinsics_c2w
 
+    def _batch_template(self, inputs):
+        """The modality set Pi this batch's sequence is packed from.
+
+        Batch-level, not per-sample: different templates give different segment counts, hence
+        different sequence lengths, which cannot share one packed tensor. `per_device_train_
+        batch_size=1` is the recipe, so this is a guard rather than a restriction -- but it
+        must be a loud one, because a silently-picked template would train a layout the
+        prompts of the other samples do not describe.
+        """
+        names = inputs.get("template")
+        if not names:
+            return ("video", ACTION)  # datasets that predate templates (bridge/droid/rlbench)
+        if len(set(names)) != 1:
+            raise ValueError(
+                f"mixed templates in one batch: {sorted(set(names))}. Different templates have "
+                f"different segment counts and cannot be packed together; use "
+                f"per_device_train_batch_size=1 or a single-template mix."
+            )
+        return parse_template(names[0])
+
     def forward(self, **inputs):
         device = self.device
         text, video, camera, action_7d, extrinsics_c2w, intrinsics_c2w = self.get_inputs(**inputs)
@@ -232,10 +289,30 @@ class ActionImagesModel(nn.Module):
         T = action_7d.shape[1]
         num_views = N // T
 
-        # prepare latents
-        video_src_latents = self.pipe.encode_video(video[:, :, :T, ...], **self.tiler_kwargs)
-        video_tgt_latents = self.pipe.encode_video(video[:, :, T:, ...], **self.tiler_kwargs)
-        T_l = video_src_latents.shape[2]  # T // 4
+        modalities = self._batch_template(inputs)
+        # `streams` carries one [B, 3, num_views*T, H, W] tensor per VISUAL modality. Datasets
+        # that predate templates only ship `video`, which is exactly Pi = {video, action}.
+        streams = inputs.get("streams") or {"video": video}
+
+        missing = [m for m in modalities if m in VISUAL_MODALITIES and m not in streams]
+        if missing:
+            # The dataset promised this template in the prompt but did not ship its pixels.
+            # Failing here beats packing a shorter sequence than the text describes.
+            raise KeyError(
+                f"template {'+'.join(modalities)} needs streams {missing}, batch has "
+                f"{sorted(streams)}"
+            )
+
+        # prepare latents: one entry per (visual modality, view)
+        visual_latents = {}
+        for modality in modalities:
+            if modality not in VISUAL_MODALITIES:
+                continue
+            pixels = streams[modality].to(dtype=self.pipe.torch_dtype, device=device)
+            visual_latents[modality] = [
+                self.pipe.encode_video(pixels[:, :, v * T : (v + 1) * T, ...], **self.tiler_kwargs)
+                for v in range(num_views)
+            ]
 
         # Prepare plucker embeddings
         extrinsics_3x4 = camera.reshape(B, -1, 3, 4)  # [B, 2T, 3, 4]
@@ -243,77 +320,41 @@ class ActionImagesModel(nn.Module):
         plucker_emb = plucker_emb.permute(0, 4, 1, 2, 3)  # [B, 6, 2T, H, W]
         direction, moment = plucker_emb[:, :3], plucker_emb[:, 3:]
         moment = moment / 3.0
-        moment_src_latents = self.pipe.encode_video(moment[:, :, :T, ...], **self.tiler_kwargs)
-        moment_tgt_latents = self.pipe.encode_video(moment[:, :, T:, ...], **self.tiler_kwargs)
-        direction_src_latents = self.pipe.encode_video(direction[:, :, :T, ...], **self.tiler_kwargs)
-        direction_tgt_latents = self.pipe.encode_video(direction[:, :, T:, ...], **self.tiler_kwargs)
+        camera_latents = []  # per view: [B, T_l, C_l, H_l, W_l]
+        for v in range(num_views):
+            sl = slice(v * T, (v + 1) * T)
+            moment_lat = self.pipe.encode_video(moment[:, :, sl, ...], **self.tiler_kwargs)
+            direction_lat = self.pipe.encode_video(direction[:, :, sl, ...], **self.tiler_kwargs)
+            cam_lat = torch.cat([direction_lat, moment_lat], dim=1)  # [B, 2C, T_l, ...]
+            camera_latents.append(cam_lat.permute(0, 2, 1, 3, 4))
 
-        camera_src_latents = torch.cat([direction_src_latents, moment_src_latents], dim=1)  # [B, 2C, T_l, ...]
-        camera_src_latents = camera_src_latents.permute(0, 2, 1, 3, 4)  # [B, T_l, C_l, H_l, W_l]
-        camera_tgt_latents = torch.cat([direction_tgt_latents, moment_tgt_latents], dim=1)  # [B, 2C, T_l, ...]
-        camera_tgt_latents = camera_tgt_latents.permute(0, 2, 1, 3, 4)  # [B, T_l, C_l, H_l, W_l]
-
-        if torch.sum(action_7d**2) != 0 and random.random() < 0.9:
-            # Action
+        # The action stream is rendered here, not loaded: the same 3D trajectory is reprojected
+        # through each view's own camera. A dataset with no usable actions (bridge) keeps the
+        # upstream behaviour of collapsing to the visual-only sequence.
+        if ACTION in modalities and torch.sum(action_7d**2) == 0:
+            modalities = tuple(m for m in modalities if m != ACTION)
+        action_latents = None
+        if ACTION in modalities:
             action_7d = action_7d.repeat(1, num_views, 1)  # [B, 2T, 7]
             action_5d = project_actions_7d_to_5d_torch_batch(action_7d, extrinsics_c2w, intrinsics_c2w)  # [B, 2T, 5]
             action_video = project_action_5d_to_rgb_torch(action_5d, H, W)  # [B, 2T, H, W, 3]
             action_video = action_video.permute(0, 4, 1, 2, 3)  # [B, 3, 2T, H, W]
             action_video = action_video * 2 - 1
-            action_src_latents = self.pipe.encode_video(action_video[:, :, :T, ...], **self.tiler_kwargs)
-            action_tgt_latents = self.pipe.encode_video(action_video[:, :, T:, ...], **self.tiler_kwargs)
-            if random.random() < 0.1 and "rlbench" in inputs["path"][0]:
-                latents = torch.cat(
-                    [
-                        video_src_latents[:, :, [0]],
-                        action_src_latents,
-                        video_tgt_latents[:, :, [0]],
-                        action_tgt_latents,
-                    ],
-                    dim=2,
-                )
-                camera_emb = torch.cat(
-                    [
-                        camera_src_latents[:, [0]],
-                        camera_src_latents,
-                        camera_tgt_latents[:, [0]],
-                        camera_tgt_latents,
-                    ],
-                    dim=1,
-                )  # [B, 4T_l, C_l, H_l, W_l]
-                # Mask strategy
-                masks = torch.zeros_like(latents, dtype=torch.bool)  # True: condition frames
-                masks[:, :, 0, ...] = 1
-                masks[:, :, 1, ...] = 1
-                masks[:, :, T_l + 1, ...] = 1
-                masks[:, :, T_l + 2, ...] = 1
-            else:
-                latents = torch.cat(
-                    [video_src_latents, action_src_latents, video_tgt_latents, action_tgt_latents], dim=2
-                )
-                camera_emb = torch.cat(
-                    [camera_src_latents, camera_src_latents, camera_tgt_latents, camera_tgt_latents], dim=1
-                )  # [B, 4T_l, C_l, H_l, W_l]
-                # Mask strategy
-                masks = torch.zeros_like(latents, dtype=torch.bool)  # True: condition frames
-                masks[:, :, 0, ...] = 1
-                masks[:, :, T_l, ...] = 1
-                masks[:, :, 2 * T_l, ...] = 1
-                masks[:, :, 3 * T_l, ...] = 1
-                p = random.random()
-                if p < 0.9:  # 2 frame --> all video & action
-                    pass
-                elif p < 0.95:  # 1st video --> 1st action + 2nd video & action
-                    masks[:, :, :T_l, ...] = 1
-                else:  # video --> action
-                    masks[:, :, :T_l, ...] = 1
-                    masks[:, :, 2 * T_l : 3 * T_l, ...] = 1
-        else:
-            latents = torch.cat([video_src_latents, video_tgt_latents], dim=2)
-            camera_emb = torch.cat([camera_src_latents, camera_tgt_latents], dim=1)  # [B, 2T_l, C_l, H_l, W_l]
-            masks = torch.zeros_like(latents, dtype=torch.bool)  # True: condition frames
-            masks[:, :, 0, ...] = 1
-            masks[:, :, T_l, ...] = 1
+            action_latents = [
+                self.pipe.encode_video(action_video[:, :, v * T : (v + 1) * T, ...], **self.tiler_kwargs)
+                for v in range(num_views)
+            ]
+
+        latents_by_modality = dict(visual_latents)
+        if action_latents is not None:
+            latents_by_modality[ACTION] = action_latents
+
+        plan = plan_segments(
+            modalities,
+            num_views,
+            is_rlbench="rlbench" in inputs["path"][0],
+        )
+        latents, camera_emb, masks = assemble(plan, latents_by_modality, camera_latents)
 
         # Loss computation
         noise = torch.randn_like(latents, device=device)
@@ -352,6 +393,15 @@ class ActionImagesModel(nn.Module):
 
 
 class ActionImagesDataCollator:
+    """Forwards an EXPLICIT key list, so dataset-internal fields never reach the model.
+
+    `template` and `streams` are the two additions over upstream. They are what turn the
+    prompt from an after-the-fact label into the control signal: without forwarding them,
+    `forward` could only infer the task from tensor VALUES (upstream inferred it from whether
+    `action_7d` happened to be all zeros), which is precisely the coupling doc 15 §6.2
+    identified as the structural problem.
+    """
+
     def __init__(self):
         pass
 
@@ -361,6 +411,23 @@ class ActionImagesDataCollator:
         batch["text"] = [example["text"] for example in examples]
         for key in ["video", "camera", "action_7d", "action_8d", "extrinsics", "intrinsics"]:
             batch[key] = torch.stack([example[key] for example in examples])
+
+        if "template" in examples[0]:
+            batch["template"] = [example["template"] for example in examples]
+        if "streams" in examples[0]:
+            keys = set(examples[0]["streams"])
+            for example in examples[1:]:
+                if set(example["streams"]) != keys:
+                    # Would silently drop a modality for part of the batch. forward's
+                    # single-template guard catches this too, but failing here names the
+                    # actual mismatch.
+                    raise ValueError(
+                        f"examples disagree on stream keys: {sorted(keys)} vs "
+                        f"{sorted(example['streams'])}"
+                    )
+            batch["streams"] = {
+                k: torch.stack([example["streams"][k] for example in examples]) for k in sorted(keys)
+            }
         return batch
 
 
@@ -449,9 +516,17 @@ class ActionImagesTrainer(Trainer):
 def train(args: TrainingArguments):
     """Training function for RLBench multi-view data using HuggingFace Trainer"""
 
+    training_pkg = assert_own_training_package()
+
     # Get local rank from distributed environment
-    # Set training-specific configurations
-    args.report_to = "wandb"
+    # Set training-specific configurations.
+    # FORK: upstream set `report_to = "wandb"` unconditionally, which silently overrode an
+    # explicit `--report_to none` and made every smoke run fail at wandb.init with "No API key
+    # configured" -- ~3 minutes into the run, after the 12.8GB checkpoint had already loaded.
+    # Honour the opt-out; default to wandb as before.
+    _report = [args.report_to] if isinstance(args.report_to, str) else list(args.report_to or [])
+    use_wandb = bool(_report) and set(_report) != {"none"}
+    args.report_to = ["wandb"] if use_wandb else []
     args.save_steps = args.checkpoint_every_n_steps
     args.save_total_limit = args.checkpoint_save_top_k if args.checkpoint_save_top_k > 0 else None
 
@@ -469,6 +544,11 @@ def train(args: TrainingArguments):
         frame_interval=1,
         height=args.height,
         width=args.width,
+        template_mix=args.template_mix,
+        prompt_tag_style=args.prompt_tag_style,
+        action_dropout_prob=args.action_dropout_prob,
+        strict_getitem=args.strict_getitem,
+        variations=args.variations,
     )
 
     # Create model
@@ -498,7 +578,7 @@ def train(args: TrainingArguments):
 
     # Initialize wandb (only on rank 0 to avoid duplicate runs)
     print(f"Local rank: {args.local_rank}, is main process: {trainer.is_world_process_zero()}")
-    if trainer.is_world_process_zero():
+    if use_wandb and trainer.is_world_process_zero():
         wandb.init(
             name=f"actionimages-{args.output_dir.split('/')[-1]}",
             config={
@@ -518,6 +598,15 @@ def train(args: TrainingArguments):
                 "tile_stride_width": args.tile_stride_width,
                 "resume_checkpoint_path": args.resume_ckpt_path,
                 "full_param": args.full_param,
+                # Which task templates the run actually trained on, how the prompts were
+                # written, and which checkout served `training` -- all silent-failure sources,
+                # so record them with the run rather than trusting the launch command.
+                "template_mix": args.template_mix,
+                "prompt_tag_style": args.prompt_tag_style,
+                "action_dropout_prob": args.action_dropout_prob,
+                "variations": args.variations,
+                "dataset_name": args.dataset_name,
+                "training_package": training_pkg,
             },
         )
     else:
@@ -544,7 +633,8 @@ def train(args: TrainingArguments):
         logger.info(f"Saved final model to {final_save_path}")
 
         # Finish wandb run
-        wandb.finish()
+        if wandb.run is not None:
+            wandb.finish()
 
 
 if __name__ == "__main__":

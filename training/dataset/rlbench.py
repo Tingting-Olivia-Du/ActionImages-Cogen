@@ -121,6 +121,15 @@ class RLBenchMVDataset(BaseDataset):
         extrinsics = []
         intrinsics = []
         raw_resolutions = []
+        # FORK: which directory each entry of `videos` came from, appended in lockstep with
+        # `videos` so view_dirs[i] is the source of videos[i]. Perception modalities must read
+        # depth.npz/mask.npz from the SAME view the pixels came from, and `glob.glob` order is
+        # not sorted and not stable across calls -- re-globbing later to recover the mapping is
+        # exactly the misalignment class that ttd's P0-1 fix had to work around with
+        # monkeypatching. Recording it here makes the invariant structural instead.
+        # NOTE: `glob.glob` is deliberately NOT sorted -- sorting would change which index
+        # random.sample() selects for a given seed and break parity with upstream.
+        view_dirs = []
         frame_indices = None
 
         # Load multi-view videos and camera parameters
@@ -139,6 +148,7 @@ class RLBenchMVDataset(BaseDataset):
                     )
                     videos.append(video)
                     raw_resolutions.append(raw_resolution)
+                    view_dirs.append(view_path)
 
                 # Load camera parameters
                 camera_params_path = os.path.join(view_path, "camera_params.json")
@@ -147,6 +157,11 @@ class RLBenchMVDataset(BaseDataset):
                     extrinsics.append(extr)
                     intrinsics.append(intr)
 
+        # Upstream appends extrinsics/intrinsics under a SEPARATE existence check, so a view
+        # with camera_params.json but no video.mp4 desyncs them from `videos`. Left as-is
+        # (changing it would alter behaviour and break the bit-exact video baseline); callers
+        # that care assert len(view_dirs) == len(extrinsics) -- see RLBenchSelfgenDataset.
+        self._last_view_dirs = view_dirs
         return videos, frame_indices, extrinsics, intrinsics, raw_resolutions, True
 
     def get_instruction(self, episode_info: Dict[str, Any]) -> str:

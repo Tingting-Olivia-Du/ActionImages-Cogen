@@ -10,6 +10,7 @@ from PIL import Image
 from torchvision.transforms import v2
 import imageio
 import random
+import traceback
 from einops import rearrange
 from training.utils import get_relative_pose_batch, CenterCropToAspect, convert_intrinsics_after_center_crop_resize
 
@@ -160,18 +161,48 @@ class BaseDataset(torch.utils.data.Dataset, ABC):
             "action_7d": actions_7d,  # T, 7
             "action_8d": actions_8d,  # T, 8
             "path": episode_path,  # str
+            # FORK: provenance of THIS sample -- which frame window and which two view dirs the
+            # pixels above were built from. Subclasses that add a second modality (depth/seg)
+            # must read it from the same window and the same views, and re-deriving that later
+            # by calling get_all_views()/random.sample() again yields a DIFFERENT draw. The
+            # collator forwards an explicit key list, so these never reach the model.
+            # Datasets whose get_all_views does not record view dirs (bridge, droid) get [].
+            "frame_indices": list(frame_indices) if frame_indices is not None else [],
+            "view_indices": list(view_indices),  # [cond, target], indexes into view_dirs
+            "view_dirs": list(getattr(self, "_last_view_dirs", None) or []),
         }
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        """Get item with retry logic for robustness."""
-        # return self.getitem(index)
-        for _ in range(50):
+        """Get item with retry logic for robustness.
+
+        FORK: upstream retried 50 times and printed `str(e)`, then re-rolled the index. That
+        turns a SYSTEMATIC failure (e.g. a perception path that raises for every episode) into
+        log spam plus silently serving whatever sample happens to succeed -- training looks
+        healthy while learning something else entirely. A transient IO error fails once; a
+        systematic one fails on every index, so 5 consecutive failures means "broken", not
+        "unlucky". Keep the retry for the transient case, raise with the first full traceback
+        for the systematic one. `strict_getitem=True` disables retries entirely (smoke runs).
+        """
+        if getattr(self, "strict_getitem", False):
+            return self.getitem(index)
+
+        first_traceback = None
+        for attempt in range(50):
             try:
                 return self.getitem(index)
             except Exception as e:
+                if first_traceback is None:
+                    first_traceback = traceback.format_exc()
+                self._getitem_failures = getattr(self, "_getitem_failures", 0) + 1
                 print(f"Error in getitem: {e}")
+                if attempt >= 4:
+                    raise RuntimeError(
+                        f"{type(self).__name__}: 5 consecutive getitem failures "
+                        f"({self._getitem_failures} total this process). This is systematic, not "
+                        f"transient -- first traceback:\n{first_traceback}"
+                    )
                 index = random.randint(0, len(self.episodes) - 1)
-        raise Exception(f"Failed to get item after 10 attempts: {index}")
+        raise Exception(f"Failed to get item after 50 attempts: {index}")
 
     def __len__(self) -> int:
         """Return the size of the dataset."""
@@ -240,6 +271,11 @@ class CombDataset(torch.utils.data.Dataset):
         frame_interval: int = 1,
         height: int = 512,
         width: int = 512,
+        template_mix: str = "video+action@1.0",
+        prompt_tag_style: str = "explicit",
+        action_dropout_prob: float = 0.1,
+        strict_getitem: bool = False,
+        variations: str = "all",
     ) -> None:
         super().__init__()
 
@@ -252,6 +288,7 @@ class CombDataset(torch.utils.data.Dataset):
         from training.dataset.bridge import BridgeMVDataset
         from training.dataset.rlbench import RLBenchMVDataset
         from training.dataset.droid import DROIDMVDataset
+        from training.dataset.rlbench_selfgen import RLBenchSelfgenDataset
 
         name_to_ctor = {
             "bridge": lambda: BridgeMVDataset(
@@ -274,6 +311,22 @@ class CombDataset(torch.utils.data.Dataset):
                 frame_interval=4,
                 height=height,
                 width=width,
+            ),
+            # FORK: self-generated RLBench with per-frame depth/mask GT alongside RGB. The only
+            # source that can serve a perception modality; `template_mix` decides which task
+            # templates it draws from. With the default "video+action@1.0" it behaves like
+            # `rlbench` on a different data tree.
+            "rlbench_selfgen": lambda: RLBenchSelfgenDataset(
+                base_path=os.path.join(dataset_path, "rlbench_selfgen"),
+                num_frames=num_frames,
+                frame_interval=frame_interval,
+                height=height,
+                width=width,
+                template_mix=template_mix,
+                prompt_tag_style=prompt_tag_style,
+                action_dropout_prob=action_dropout_prob,
+                strict_getitem=strict_getitem,
+                variations=variations,
             ),
         }
 
