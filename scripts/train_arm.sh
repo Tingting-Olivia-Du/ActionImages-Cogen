@@ -72,10 +72,10 @@ if [ -z "${WANDB_API_KEY:-}" ]; then
   exit 4
 fi
 
-GPUS="${GPUS:-4,7}"
+GPUS="${GPUS:-1,4}"
 SEED="${SEED:-42}"
 RES="${RES:-256}"
-PORT="${PORT:-29559}"
+PORT="${PORT:-29556}"
 VARIATIONS="${VARIATIONS:-0}"   # 训练只看 variation0;其余 variation 是留出测试集
 SLUG="$(echo "$ARM" | tr -c '[:alnum:]+' '_')"
 OUT="${OUT:-$REPO/outputs/${SLUG}_seed${SEED}}"

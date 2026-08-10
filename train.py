@@ -477,6 +477,16 @@ class ActionImagesTrainer(Trainer):
         # Call parent method for other checkpoint data
         super()._save_checkpoint(model, trial)
 
+        # EVERY rank must execute this barrier. A collective that only some ranks call is not
+        # a no-op for the others: NCCL matches collectives by CALL ORDER, not by name, so a
+        # rank-0-only barrier pairs with rank 1's next allreduce, training continues on a
+        # desynchronised communicator, and the watchdog aborts the job ~10 minutes later with
+        # SIGABRT and no useful traceback. That is exactly how arm0 and arm1 died on
+        # 2026-08-10 (checkpoint written 17:16:47, abort 17:27:08 -- the 600s NCCL timeout).
+        # It belongs here, ABOVE the rank-0 early return, not inside _prune_resume_state.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
         if not self.is_world_process_zero():
             return
 
@@ -541,10 +551,9 @@ class ActionImagesTrainer(Trainer):
         import glob
         import shutil
 
-        # DeepSpeed writes shards from every rank; do not prune until they have all landed.
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier()
-
+        # No barrier here: this method runs on rank 0 ONLY, so a collective inside it
+        # deadlocks/desynchronises the job (see the note in _save_checkpoint). The
+        # all-ranks barrier that guarantees every shard has landed is already done there.
         keep = os.path.abspath(keep)
         freed = 0
         for ckpt_dir in sorted(glob.glob(os.path.join(run_dir, "checkpoint-*"))):
