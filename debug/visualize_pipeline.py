@@ -452,10 +452,332 @@ def stage10_segment_scales(pipe, dep_sample, rgb_sample, device, report):
           f"{ {k: round(v['std'], 3) for k, v in stats.items()} }")
 
 
+# ======================================================================================
+# Template-era stages. S1-S10 predate task templates and still describe the pieces
+# (codec, action rendering, latent scale). What they cannot show is the thing the template
+# design actually introduced: WHICH modalities are in the sequence and WHICH of them are
+# given. Those are the two axes the whole study turns on, and until S11 nothing drew them.
+# ======================================================================================
+TEMPLATE_GALLERY = [
+    ("video+action", "official recipe -- the control arm"),
+    ("video+depth", "PERCEPTION: RGB given -> depth predicted"),
+    ("video+segmentation", "PERCEPTION: RGB given -> referring seg predicted"),
+    ("video+depth+action", "CO-GENERATION: 6 segments, the previously unreachable cell"),
+    ("depth+action", "WORLD MODEL: no RGB anywhere -- NOT perception"),
+]
+
+
+def _sample_for(ds, index, template, seed=7):
+    random.seed(seed)
+    return ds.getitem(index, force_template=template)
+
+
+def _action_pixels(sample):
+    """The action stream exactly as ActionImagesModel.forward renders it. [2T,H,W,3] uint8."""
+    T = NUM_FRAMES
+    a7 = sample["action_7d"].unsqueeze(0)
+    num_views = sample["video"].shape[1] // T
+    a5 = project_actions_7d_to_5d_torch_batch(
+        a7.repeat(1, num_views, 1),
+        sample["extrinsics"].unsqueeze(0),
+        sample["intrinsics"].unsqueeze(0),
+    )
+    av = project_action_5d_to_rgb_torch(a5, RES, RES).permute(0, 4, 1, 2, 3) * 2 - 1
+    return to_uint8(av[0])
+
+
+def stage11_template_gallery(ds, index, report):
+    """One row per segment, for every template: what the DiT sees and what it must predict.
+
+    The green/red strip on the right is the condition mask straight out of plan_segments +
+    assemble -- not a redrawing of it. That matters: a mask that is drawn by hand next to a
+    layout built by code can agree with the picture and disagree with training.
+    """
+    from training.templates import assemble, parse_template, plan_segments
+
+    T = NUM_FRAMES
+    T_l = (T - 1) // 4 + 1
+    gallery = {}
+
+    for template, blurb in TEMPLATE_GALLERY:
+        sample = _sample_for(ds, index, template)
+        if sample["template"] != template:
+            print(f"  !! {template} degraded to {sample['template']} on index {index}; skipping")
+            continue
+        mods = parse_template(sample["template"])
+        px = {k: to_uint8(v) for k, v in sample["streams"].items()}
+        if "action" in mods:
+            px["action"] = _action_pixels(sample)
+
+        # Build the REAL plan/mask with a dummy latent set of the right shape.
+        dummy = {m: [torch.zeros(1, 4, T_l, 2, 2) for _ in range(2)] for m in mods}
+        cam = [torch.zeros(1, T_l, 4, 2, 2) for _ in range(2)]
+        rng = random.Random(0)
+        plan = plan_segments(mods, num_views=2, rng=rng, is_rlbench=True)
+        _, _, masks = assemble(plan, dummy, cam)
+        given = masks[0, 0, :, 0, 0].tolist()
+
+        n_seg = len(plan)
+        show = picks(T, 4)
+        fig, axes = plt.subplots(n_seg, 5, figsize=(15, 2.9 * n_seg + 1.2))
+        if n_seg == 1:
+            axes = axes[None, :]
+        off = 0
+        for r, seg in enumerate(plan):
+            half = slice(seg.view * T, (seg.view + 1) * T)
+            frames_px = px[seg.modality][half]
+            seg_len = 1 if seg.single_frame else T_l
+            seg_given = given[off:off + seg_len]
+            off += seg_len
+            for c, f in enumerate(show):
+                axes[r, c].imshow(frames_px[f]); axes[r, c].axis("off")
+                # latent frame index this pixel frame lands in (VAE compresses 4x in time)
+                lf = 0 if f == 0 else min(seg_len - 1, (f - 1) // 4 + 1)
+                is_given = bool(seg_given[lf])
+                axes[r, c].set_title(
+                    f"t={f}  " + ("GIVEN" if is_given else "predict"),
+                    fontsize=8, color=("tab:green" if is_given else "tab:red"))
+            strip = np.array(seg_given, dtype=float)[None, :]
+            axes[r, 4].imshow(strip, cmap="RdYlGn", vmin=0, vmax=1, aspect="auto")
+            axes[r, 4].set_title(f"mask, {seg_len} latent frames", fontsize=8)
+            axes[r, 4].set_yticks([]); axes[r, 4].set_xticks(range(seg_len))
+            axes[r, 4].set_xticklabels(range(seg_len), fontsize=6)
+            axes[r, 0].axis("on"); axes[r, 0].set_xticks([]); axes[r, 0].set_yticks([])
+            axes[r, 0].set_ylabel(f"seg {r}\nview{seg.view + 1} {seg.modality}", fontsize=9)
+
+        n_given = int(sum(given))
+        fig.suptitle(
+            f"S11  template = {template}\n{blurb}\n"
+            f"prompt: {sample['text'][:110]}\n"
+            f"{n_seg} segments, {len(given)} latent frames, {n_given} given / "
+            f"{len(given) - n_given} predicted",
+            fontsize=11)
+        savefig(fig, f"S11_template_{template.replace('+', '_')}.png")
+        gallery[template] = {
+            "segments": [f"v{s.view + 1}_{s.modality}" for s in plan],
+            "latent_frames": len(given),
+            "given": n_given,
+            "predicted": len(given) - n_given,
+            "prompt": sample["text"],
+            "streams": sorted(sample["streams"]),
+        }
+    report["S11_templates"] = gallery
+    return gallery
+
+
+def stage12_seg_chain(ds, index, report):
+    """The segmentation arm end to end: GT handle map -> known-colour RGB -> decode -> IoU.
+
+    Never visualised before. FORK_CHANGES §5 records that the seg branch was written and unit
+    tested but never run, so every failure mode here is unobserved: a colour map that does not
+    match the prompt, a target that is empty from one viewpoint, a palette colour the decoder
+    rounds to its neighbour.
+    """
+    from training.percep.seg_codec import build_referring_spec
+
+    sample = _sample_for(ds, index, "video+segmentation")
+    if "segmentation" not in sample["streams"]:
+        print(f"  !! index {index} resolves no seg target; skipping S12")
+        return None
+    frames = sample["frame_indices"]
+    views = [sample["view_dirs"][i] for i in sample["view_indices"]]
+    T, fi = NUM_FRAMES, picks(NUM_FRAMES)
+
+    instruction = sample["text"].split("> ", 1)[-1]
+    seg_targets = json.load(open(os.path.join(sample["path"], "seg_targets.json")))
+    id_groups, color_map, _ = build_referring_spec(seg_targets, instruction)
+
+    seg_u8 = to_uint8(sample["streams"]["segmentation"])
+    rgb_u8 = to_uint8(sample["streams"]["video"])
+
+    ious, empty = {}, 0
+    fig, axes = plt.subplots(4, len(fi) * 2, figsize=(2.5 * len(fi) * 2, 10.4))
+    for half, (name, offset) in enumerate([("cond", 0), ("target", T)]):
+        view = views[half]
+        mask_map = np.load(os.path.join(view, "mask.npz"))["mask"][frames]
+        dec = decode_known_color(seg_u8[offset:offset + T], color_map)
+        for c, f in enumerate(fi):
+            col = half * len(fi) + c
+            axes[0, col].imshow(rgb_u8[offset + f]); axes[0, col].axis("off")
+            axes[0, col].set_title(f"{name} {os.path.basename(view)} t={f}", fontsize=8)
+            axes[1, col].imshow(mask_map[f], cmap="tab20"); axes[1, col].axis("off")
+            axes[2, col].imshow(seg_u8[offset + f]); axes[2, col].axis("off")
+            overlay = rgb_u8[offset + f].astype(np.float32).copy()
+            paint = seg_u8[offset + f].sum(-1) > 30
+            overlay[paint] = 0.35 * overlay[paint] + 0.65 * seg_u8[offset + f][paint]
+            axes[3, col].imshow(overlay.astype(np.uint8)); axes[3, col].axis("off")
+        for inst, ids in id_groups.items():
+            gt = handles_to_mask(mask_map, ids)
+            pred = dec[inst]
+            if gt.sum() == 0:
+                empty += 1
+                continue
+            inter = float((gt & pred).sum()); union = float((gt | pred).sum())
+            ious[f"{name}/{inst}"] = inter / union if union else 1.0
+    for r, lab in enumerate(["natural RGB", "GT handle map", "known-colour encode",
+                             "encode over RGB"]):
+        axes[r, 0].axis("on"); axes[r, 0].set_xticks([]); axes[r, 0].set_yticks([])
+        axes[r, 0].set_ylabel(lab, fontsize=9)
+    worst = min(ious.values()) if ious else float("nan")
+    fig.suptitle(
+        f"S12  segmentation chain. colour map = {color_map}\n"
+        f"prompt: {sample['text'][:110]}\n"
+        f"roundtrip IoU worst={worst:.4f} over {len(ious)} instance-views "
+        f"({empty} not visible from that viewpoint -> skipped)", fontsize=11)
+    savefig(fig, "S12_seg_chain.png")
+    report["S12_seg"] = {"color_map": color_map, "iou": ious, "worst_iou": worst,
+                         "not_visible": empty, "prompt": sample["text"]}
+    print(f"  S12 seg worst IoU={worst:.4f} over {len(ious)} instance-views, {empty} not visible")
+    return sample
+
+
+def stage13_mode_mix(report):
+    """The four given/predicted patterns a video+action sample can draw, side by side.
+
+    Same template, same pixels -- only the mask differs. This is Action-Images' own task
+    switch (paper §3.3: i2va / a2v / v2a / video-only), and it is orthogonal to the prompt.
+    Drawing it makes clear why the given/predict axis is NOT part of the tag language.
+    """
+    from training.templates import assemble, parse_template, plan_segments
+
+    T_l = (NUM_FRAMES - 1) // 4 + 1
+    mods = parse_template("video+action")
+    dummy = {m: [torch.zeros(1, 4, T_l, 2, 2) for _ in range(2)] for m in mods}
+    cam = [torch.zeros(1, T_l, 4, 2, 2) for _ in range(2)]
+
+    class Scripted:
+        def __init__(self, vals): self.v = list(vals); self.i = 0
+        def random(self):
+            x = self.v[self.i]; self.i += 1; return x
+
+    cases = [
+        ("joint (p<0.90, ~81% of steps)\ni2va: first frames -> everything", [0.5, 0.5]),
+        ("first segment given (0.90<=p<0.95)\nview1 video known", [0.5, 0.92]),
+        ("v2a (p>=0.95)\nboth videos known -> infer action", [0.5, 0.99]),
+        ("single-frame variant (10%, rlbench only)\npolicy mode: video collapsed to 1 frame",
+         [0.05]),
+    ]
+    fig, axes = plt.subplots(len(cases), 1, figsize=(13, 2.5 * len(cases)))
+    out = {}
+    for ax, (label, script) in zip(axes, cases):
+        plan = plan_segments(mods, num_views=2, rng=Scripted(script), is_rlbench=True)
+        _, _, masks = assemble(plan, dummy, cam)
+        given = np.array(masks[0, 0, :, 0, 0].tolist(), dtype=float)
+        ax.imshow(given[None, :], cmap="RdYlGn", vmin=0, vmax=1, aspect="auto")
+        ax.set_yticks([])
+        ax.set_xticks(range(len(given)))
+        ax.set_xticklabels(range(len(given)), fontsize=6)
+        bound = 0
+        for seg in plan:
+            n = 1 if seg.single_frame else T_l
+            ax.axvline(bound - 0.5, color="black", lw=2)
+            ax.text(bound + n / 2 - 0.5, -0.62, f"v{seg.view + 1}_{seg.modality}",
+                    ha="center", fontsize=8)
+            bound += n
+        ax.set_title(f"{label}   ->  {int(given.sum())}/{len(given)} latent frames given",
+                     fontsize=9, loc="left")
+        out[label.split("\n")[0]] = {"given": int(given.sum()), "total": int(len(given))}
+    fig.suptitle("S13  video+action: the SAME prompt, four different masks.\n"
+                 "green = given (kept clean), red = denoised from noise. The prompt picks the "
+                 "modalities; the mask picks the task.", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    savefig(fig, "S13_mode_mix_masks.png")
+    report["S13_mode_mix"] = out
+
+
+def stage14_seg_vae(pipe, seg_sample, device, report):
+    """Does the VAE preserve the seg palette? The open risk for the seg arm, same as S5's.
+
+    The palette is eight saturated colours on pure black -- far from natural video statistics.
+    If the VAE rounds them together, decode_known_color assigns pixels to the wrong instance
+    and the seg arm cannot work regardless of how correct the data plumbing is. Every test in
+    tests/ would still pass, because they all stop at the codec.
+    """
+    from training.percep.seg_codec import build_referring_spec
+
+    T = NUM_FRAMES
+    instruction = seg_sample["text"].split("> ", 1)[-1]
+    seg_targets = json.load(open(os.path.join(seg_sample["path"], "seg_targets.json")))
+    id_groups, color_map, _ = build_referring_spec(seg_targets, instruction)
+
+    rows, stats = [], {}
+    for name, offset, vi in (("cond", 0, 0), ("target", T, 1)):
+        seg = seg_sample["streams"]["segmentation"][:, offset:offset + T]
+        rec, _ = vae_roundtrip(pipe, seg, device)
+        pre_u8, post_u8 = to_uint8(seg), to_uint8(rec)
+        view = seg_sample["view_dirs"][seg_sample["view_indices"][vi]]
+        mask_map = np.load(os.path.join(view, "mask.npz"))["mask"][seg_sample["frame_indices"]]
+        dec_pre = decode_known_color(pre_u8, color_map)
+        dec_post = decode_known_color(post_u8, color_map)
+        for inst, ids in id_groups.items():
+            gt = handles_to_mask(mask_map, ids)
+            if gt.sum() == 0:
+                continue
+            for tag, dec in (("codec_only", dec_pre), ("after_vae", dec_post)):
+                inter = float((gt & dec[inst]).sum()); union = float((gt | dec[inst]).sum())
+                stats[f"{name}/{inst}/{tag}"] = inter / union if union else 1.0
+        rows.append((name, pre_u8, post_u8))
+
+    fi = picks(T)
+    fig, axes = plt.subplots(3, len(fi) * 2, figsize=(2.5 * len(fi) * 2, 7.8))
+    for half, (name, pre_u8, post_u8) in enumerate(rows):
+        for c, f in enumerate(fi):
+            col = half * len(fi) + c
+            axes[0, col].imshow(pre_u8[f]); axes[0, col].axis("off")
+            axes[0, col].set_title(f"{name} t={f}", fontsize=8)
+            axes[1, col].imshow(post_u8[f]); axes[1, col].axis("off")
+            diff = np.abs(pre_u8[f].astype(int) - post_u8[f].astype(int)).sum(-1)
+            im = axes[2, col].imshow(diff, cmap="magma", vmin=0, vmax=120)
+            axes[2, col].axis("off")
+    for r, lab in enumerate(["encode (codec only)", "after VAE roundtrip", "|difference|"]):
+        axes[r, 0].axis("on"); axes[r, 0].set_xticks([]); axes[r, 0].set_yticks([])
+        axes[r, 0].set_ylabel(lab, fontsize=9)
+    pre_ious = [v for k, v in stats.items() if k.endswith("codec_only")]
+    post_ious = [v for k, v in stats.items() if k.endswith("after_vae")]
+    fig.suptitle(
+        f"S14  seg through the VAE -- the risk S5 measured for depth, never measured for seg.\n"
+        f"IoU codec-only min={min(pre_ious) if pre_ious else float('nan'):.4f}  ->  "
+        f"after VAE min={min(post_ious) if post_ious else float('nan'):.4f}", fontsize=11)
+    savefig(fig, "S14_seg_vae_roundtrip.png")
+    report["S14_seg_vae"] = stats
+    print(f"  S14 seg IoU codec-only min={min(pre_ious) if pre_ious else float('nan'):.4f}, "
+          f"after VAE min={min(post_ious) if post_ious else float('nan'):.4f}")
+
+
+def stage15_cost(gallery, report):
+    """Sequence length and attention cost per template -- the numbers doc 16 §3 claims."""
+    if not gallery:
+        return
+    H_l = RES // 16          # Wan2.2 VAE upsampling_factor
+    tok_per_lat = (H_l // 2) ** 2   # DiT patch_size (1,2,2)
+    names = list(gallery)
+    toks = [gallery[n]["latent_frames"] * tok_per_lat for n in names]
+    base = toks[names.index("video+action")] if "video+action" in names else toks[0]
+
+    fig, ax = plt.subplots(figsize=(10, 4.6))
+    colors = ["tab:gray" if n == "video+action" else
+              ("tab:red" if len(n.split("+")) > 2 else "tab:blue") for n in names]
+    ax.bar(range(len(names)), toks, color=colors, alpha=0.85)
+    for i, (n, t) in enumerate(zip(names, toks)):
+        ax.text(i, t + 60, f"{t}\n{t / base:.2f}x seq\n{(t / base) ** 2:.2f}x attn",
+                ha="center", fontsize=8)
+    ax.set_xticks(range(len(names)))
+    ax.set_xticklabels(names, rotation=15, fontsize=9)
+    ax.set_ylabel(f"DiT tokens ({RES}^2, {NUM_FRAMES} frames, 2 views)")
+    ax.set_ylim(0, max(toks) * 1.28)
+    ax.set_title("S15  Cost per template. The perception templates are FREE relative to the\n"
+                 "official recipe -- depth takes the action slot rather than being appended.")
+    savefig(fig, "S15_template_cost.png")
+    report["S15_cost"] = {n: {"tokens": t, "rel_seq": round(t / base, 3),
+                              "rel_attn": round((t / base) ** 2, 3)}
+                          for n, t in zip(names, toks)}
+    print(f"  S15 tokens: { {n: t for n, t in zip(names, toks)} }")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--index", type=int, default=0)
-    ap.add_argument("--no-vae", action="store_true", help="skip GPU stages S5/S6/S9")
+    ap.add_argument("--no-vae", action="store_true", help="skip GPU stages S5/S6/S9/S14")
     args = ap.parse_args()
 
     os.makedirs(OUT, exist_ok=True)
@@ -471,6 +793,16 @@ def main():
     print("S7/S8  action stream + assembled sequence")
     stage7_8_action_and_layout(dep, "cpu", report)
 
+    # Template-era stages. These are the ones that describe the CURRENT design.
+    print("S11  per-template layout + condition mask")
+    gallery = stage11_template_gallery(ds, args.index, report)
+    print("S12  segmentation chain (GT -> known-colour -> decode -> IoU)")
+    seg_sample = stage12_seg_chain(ds, args.index, report)
+    print("S13  mode-mix masks for video+action")
+    stage13_mode_mix(report)
+    print("S15  per-template sequence length / attention cost")
+    stage15_cost(gallery, report)
+
     if not args.no_vae:
         device = "cuda"
         print("S5/S6/S9  loading VAE ...")
@@ -478,6 +810,9 @@ def main():
         stage5_6_vae(pipe, dep, rgb, views, frames, device, report)
         stage9_latents(pipe, dep, rgb, device, report)
         stage10_segment_scales(pipe, dep, rgb, device, report)
+        if seg_sample is not None:
+            print("S14  seg through the VAE")
+            stage14_seg_vae(pipe, seg_sample, device, report)
 
     with open(os.path.join(OUT, "report.json"), "w") as f:
         json.dump(report, f, indent=2)

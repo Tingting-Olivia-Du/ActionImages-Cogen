@@ -10,9 +10,14 @@
 #   GPUS=4,7 bash scripts/smoke_arm.sh video+depth+action  # 6 segments, ~1.5x sequence
 #   GPUS=4,7 bash scripts/smoke_arm.sh "video+action@0.6,video+depth@0.4"   # a whole mix
 #
-# Use the SAME GPU count and deepspeed config the real arm will use. full_param=True on a 5B
-# model does not fit a single 48GB card without ZeRO-2 + CPU optimizer offload, so a
-# single-process smoke would OOM for a reason that has nothing to do with the template.
+# Use the SAME GPU count and deepspeed config the real arm will use. TWO GPUs minimum:
+# measured 2026-08-10, a single-GPU smoke loads and starts fine (~29GB resident) and then OOMs
+# in the FIRST optimizer step --
+#     stage_1_and_2.py:1891  fp32_partition.to(device)   tried to allocate 23.89 GiB
+# because ZeRO-2 with world_size=1 has nothing to partition across, so the whole fp32 master
+# copy has to land on the one device during the step. With 2 ranks each partition is half that
+# and it fits. The failure is an artefact of the GPU COUNT, not of the template or the code, so
+# do not read a single-GPU OOM as a problem with the arm under test.
 #
 # --strict_getitem True + --dataloader_num_workers 0 deliberately: a broken data path should
 # surface as a traceback in the main process, not as retry spam that quietly serves a

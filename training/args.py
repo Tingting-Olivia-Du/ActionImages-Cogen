@@ -156,6 +156,14 @@ class TrainingArguments(transformers.TrainingArguments):
     checkpoint_monitor: str = field(
         default="train_loss", metadata={"help": "Metric to monitor for best checkpoint selection."}
     )
+    keep_optimizer_last_only: bool = field(
+        default=True,
+        metadata={"help": "Keep DeepSpeed resume state (global_step*/) only in the NEWEST "
+                          "checkpoint, and never keep HF's redundant fp32 pytorch_model.bin. "
+                          "Takes a checkpoint directory from ~144GB to ~12GB once it is no "
+                          "longer the resume tip, while every stepN.ckpt stays for eval. "
+                          "Set False to keep every checkpoint independently resumable."},
+    )
 
     def __post_init__(self):
         # Handle legacy argument mappings

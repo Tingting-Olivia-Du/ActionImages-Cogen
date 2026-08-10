@@ -512,6 +512,72 @@ class ActionImagesTrainer(Trainer):
                 step=self.state.global_step,
             )
 
+        if getattr(self.args, "keep_optimizer_last_only", True):
+            self._prune_resume_state(run_dir, keep=checkpoint_dir)
+
+    def _prune_resume_state(self, run_dir, keep):
+        """Keep resume state only in the NEWEST checkpoint; every older one keeps just weights.
+
+        Measured on arm0 (2026-08-10), one checkpoint directory is 144GB:
+
+            global_stepN/       108G   DeepSpeed ZeRO-2: fp32 master + Adam m/v + grads
+                                       (6.42e9 params x ~16 bytes)
+            pytorch_model.bin    24G   HF's fp32 copy of the model (6.42e9 x 4)
+            stepN.ckpt           12G   DiT-only bf16 -- the ONLY file eval and warm-start read
+
+        At 250-step cadence over 10k steps that projects to 5.8TB, and it had already consumed
+        490GB of a volume with 530GB free. The model is 9% of what gets written.
+
+        `pytorch_model.bin` is deleted unconditionally because nothing in this codebase reads
+        it: `find_latest_checkpoint` looks for `step{N}.ckpt`, `ActionImagesModel.__init__`
+        loads that `.ckpt`, and DeepSpeed resume reads `global_step*/`. (Same finding as ttd
+        DECISIONS.md D-040, which removed it by skipping `super()._save_checkpoint()` entirely
+        -- at the cost of losing optimizer resume. Pruning after the fact keeps both.)
+
+        Older `global_step*/` are droppable because they only let you resume from THAT step,
+        and a run resumes from its newest checkpoint. Steady state becomes 12GB per retained
+        checkpoint plus ~120GB for the resumable tip.
+        """
+        import glob
+        import shutil
+
+        # DeepSpeed writes shards from every rank; do not prune until they have all landed.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+
+        keep = os.path.abspath(keep)
+        freed = 0
+        for ckpt_dir in sorted(glob.glob(os.path.join(run_dir, "checkpoint-*"))):
+            if not os.path.isdir(ckpt_dir):
+                continue
+            is_newest = os.path.abspath(ckpt_dir) == keep
+            victims = ["pytorch_model.bin", "model.safetensors"]
+            if not is_newest:
+                # Resume state for a step nothing will resume from.
+                victims += ["optimizer.pt", "scheduler.pt", "latest", "zero_to_fp32.py",
+                            "rng_state_0.pth", "rng_state_1.pth"]
+                victims += [os.path.basename(p)
+                            for p in glob.glob(os.path.join(ckpt_dir, "global_step*"))]
+            for name in victims:
+                path = os.path.join(ckpt_dir, name)
+                if not os.path.exists(path):
+                    continue
+                try:
+                    if os.path.isdir(path):
+                        size = sum(os.path.getsize(os.path.join(r, f))
+                                   for r, _, fs in os.walk(path) for f in fs)
+                        shutil.rmtree(path)
+                    else:
+                        size = os.path.getsize(path)
+                        os.remove(path)
+                    freed += size
+                except OSError as e:
+                    # Never let cleanup kill a training run that has otherwise succeeded.
+                    logger.warning(f"could not prune {path}: {e}")
+        if freed:
+            logger.info(f"pruned {freed / 1e9:.1f} GB of redundant checkpoint state "
+                        f"(resume state kept only in {os.path.basename(keep)})")
+
 
 def train(args: TrainingArguments):
     """Training function for RLBench multi-view data using HuggingFace Trainer"""

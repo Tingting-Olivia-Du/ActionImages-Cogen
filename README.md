@@ -123,6 +123,20 @@ python training/dataset/test_dataset.py --dataset rlbench --backend torch  # or 
 
 ## Training
 
+> **This fork adds task templates.** A sample's prompt announces which modalities occupy the
+> DiT sequence, and the mask decides which of them are given -- so `video+depth` (RGB fully
+> given, depth predicted) is *perception* in the GenCeption / Vision Banana sense, while
+> `depth+action` is a depth-space *world model*. See **[CHANGES_TEMPLATES.md](CHANGES_TEMPLATES.md)**
+> for the full change record and **[FORK_CHANGES.md](FORK_CHANGES.md)** for the fork's history
+> against upstream. Run an experimental arm with:
+>
+> ```bash
+> GPUS=4,7 bash scripts/train_arm.sh arm0   # video+action@1.0 -- the control
+> GPUS=4,7 bash scripts/train_arm.sh arm1   # 60% action / 20% depth / 20% seg
+> GPUS=4,7 bash scripts/train_arm.sh arm2   # 50% action / 50% co-generation
+> bash scripts/run_tests.sh                 # CPU test suite
+> ```
+
 ### Pre-training or Full Fine-tuning
 
 The training code supports distributed training with multiple GPUs via DeepSpeed ZeRO. Wan backbone weights are downloaded automatically on first run.

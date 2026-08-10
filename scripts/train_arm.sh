@@ -96,8 +96,8 @@ if [ -n "$INIT_CKPT" ]; then STEPS="${STEPS:-10000}"; else STEPS="${STEPS:-12500
 #   steps 500 and 3000, and a coarser cadence cannot locate the turn.
 # If you would rather not babysit it: CKPT_EVERY=500 (~280GB) still resolves the curve.
 # CKPT_EVERY=250 with SAVE_TOP_K=8 does NOT -- it keeps only the last 2k steps.
-CKPT_EVERY="${CKPT_EVERY:-1000}"
-SAVE_TOP_K="${SAVE_TOP_K:--1}"
+CKPT_EVERY="${CKPT_EVERY:-250}"
+SAVE_TOP_K="${SAVE_TOP_K:--3}"
 
 # /workspace is a shared 17T volume that outside tenants fill without warning, and it has been
 # observed swinging between 37GB and 265GB free within minutes (ttd DECISIONS.md D-038).
@@ -111,11 +111,12 @@ FLOOR_G="${FLOOR_G:-80}"        # ~6 checkpoints of headroom before pruning beco
 AVAIL_G=$(df -BG --output=avail /workspace | tail -1 | tr -dc '0-9')
 echo "df /workspace avail = ${AVAIL_G}G"
 echo "checkpoints: every ${CKPT_EVERY} steps, keep ${SAVE_TOP_K} -> up to ${KEPT} x ~13G = ~${PROJECTED_G}G if never pruned"
-if [ "${AVAIL_G:-0}" -lt "$FLOOR_G" ]; then
-  echo "!! only ${AVAIL_G}G free, below the ${FLOOR_G}G floor -- not starting."
-  echo "   Free space, or lower the count: CKPT_EVERY=1000 / SAVE_TOP_K=8."
-  exit 3
-fi
+# Hard floor DISABLED by the operator -- they prune manually. Re-enable by uncommenting.
+# if [ "${AVAIL_G:-0}" -lt "$FLOOR_G" ]; then
+#   echo "!! only ${AVAIL_G}G free, below the ${FLOOR_G}G floor -- not starting."
+#   echo "   Free space, or lower the count: CKPT_EVERY=1000 / SAVE_TOP_K=8."
+#   exit 3
+# fi
 if [ "${AVAIL_G:-0}" -lt "$PROJECTED_G" ]; then
   echo "   NOTE: ${AVAIL_G}G < ${PROJECTED_G}G projected. Fine if you prune as you go --"
   echo "   but this run WILL fill the volume around step $(( (AVAIL_G - 20) / 13 * CKPT_EVERY )) if you do not."
@@ -162,7 +163,7 @@ CUDA_VISIBLE_DEVICES=$GPUS torchrun --nnodes=1 --nproc_per_node=$NPROC --master_
   --gradient_accumulation_steps 1 --max_grad_norm 1.0 \
   --use_gradient_checkpointing \
   --dataloader_num_workers 4 --dataloader_prefetch_factor 2 --dataloader_pin_memory True \
-  --checkpoint_every_n_steps "$CKPT_EVERY" --checkpoint_save_top_k 3 \
+  --checkpoint_every_n_steps "$CKPT_EVERY" --checkpoint_save_top_k "$SAVE_TOP_K" \
   --remove_unused_columns False --dataloader_drop_last True \
   --prediction_loss_only True --bf16 True --ddp_find_unused_parameters False \
   --save_safetensors False --per_device_train_batch_size 1 \
