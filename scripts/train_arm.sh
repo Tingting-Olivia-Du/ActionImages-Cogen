@@ -138,7 +138,18 @@ mkdir -p "$OUT"
 INIT_ARG=""
 [ -n "$INIT_CKPT" ] && INIT_ARG="--init_ckpt_path $INIT_CKPT"
 echo "arm=$ARM mix='$MIX' GPUS=$GPUS NPROC=$NPROC SEED=$SEED STEPS=$STEPS RES=$RES OUT=$OUT"
-echo "init: ${INIT_CKPT:-<Wan base, no warm-start (stage 2)>}"
+# Report what the weights will ACTUALLY come from, not just what got passed on the command
+# line. train.py prefers resume_ckpt_path (found in output_dir) over init_ckpt_path, so
+# printing INIT_CKPT unconditionally reads as "starting from the warm-start checkpoint" even
+# when the run is really continuing from its own latest checkpoint.
+RESUME_CKPT=""
+[ -n "$RESUME_FROM" ] && RESUME_CKPT=$(ls "$RESUME_FROM"/step*.ckpt 2>/dev/null | head -1)
+if [ -n "$RESUME_CKPT" ]; then
+  echo "weights: RESUME from $RESUME_CKPT"
+  echo "         (--init_ckpt_path ${INIT_CKPT:-<none>} is passed but IGNORED -- resume wins)"
+else
+  echo "weights: warm-start from ${INIT_CKPT:-<Wan base, no warm-start (stage 2)>}"
+fi
 
 # zero2_offload, not zero.json: full_param=True on a 5B model needs the Adam states on CPU to
 # fit two 48GB cards at 256^2. This is the config the 14.5 s/it throughput figure was measured
