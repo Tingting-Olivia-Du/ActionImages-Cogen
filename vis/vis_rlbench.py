@@ -80,7 +80,9 @@ def load_rlbench_action_data(episode_path):
 
     # action_3d is a [T, 8] array: [x, y, z, qx, qy, qz, qw, openness]
     action_3d = np.load(action_path)
-    key_frames = np.load(key_frames_path) // 4  # This array maps each action to the corresponding video frame
+    # Some RLBench exports do not include key_frames.npy. The current
+    # visualization path does not use this mapping, so keep it optional.
+    key_frames = np.load(key_frames_path) // 4 if os.path.exists(key_frames_path) else None
 
     return action_3d, key_frames
 

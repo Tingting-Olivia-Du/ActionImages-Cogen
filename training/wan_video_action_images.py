@@ -398,7 +398,7 @@ class WanVideoActionImagesPipeline(BasePipeline):
         video: torch.Tensor,
         camera: torch.Tensor,
         action_7d: torch.Tensor,
-        action_5d: Optional[torch.Tensor],
+        action_5d: Optional[torch.Tensor],#action image pos-xy, normal-xy, up-xy,
         extrinsics: torch.Tensor,
         intrinsics: torch.Tensor,
         task_type: Optional[str],

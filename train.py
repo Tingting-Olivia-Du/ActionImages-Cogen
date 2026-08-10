@@ -343,7 +343,7 @@ class ActionImagesModel(nn.Module):
         loss = (se.sum((1, 2, 3, 4)) / valid.sum((1, 2, 3, 4)).clamp_min(1)).mean()
 
         loss = loss * self.pipe.scheduler.training_weight(timestep)
-
+        
         return {"loss": loss}
 
     @property
@@ -405,10 +405,48 @@ class ActionImagesTrainer(Trainer):
             return loss, outputs
         return loss
 
+    def save_model(self, output_dir=None, _internal_call=False):
+        """Skip HF's fp32 `pytorch_model.bin` during checkpointing -- do not write it at all.
+
+        Pruning it after the fact was not enough. On 2026-08-10 a run died at checkpoint-750
+        with
+
+            PytorchStreamWriter failed writing file data/4: file write failed
+            unexpected pos 25662237504 vs 25662237336
+            OSError: [Errno 28] No space left on device
+
+        -- 25,662,237,504 bytes is exactly `pytorch_model.bin`. The volume filled up WHILE
+        writing a 25.6GB file that `_prune_resume_state` deletes seconds later. Writing then
+        deleting only reclaims space; it still requires the space to exist first, so on a
+        tight volume the write itself is what kills the run.
+
+        `_save_checkpoint` calls this (transformers 4.57.3, line 13 of its body) and then
+        calls `_save_optimizer_and_scheduler` SEPARATELY (line 33), which is what writes
+        DeepSpeed's `global_step*/`. Suppressing this call therefore costs nothing that
+        resume needs, and the weights are still saved -- as the DiT-only bf16 `stepN.ckpt`
+        that `_save_checkpoint` writes below and that everything here actually reads.
+
+        Only the internal checkpointing call is suppressed; an explicit `save_model()` by a
+        caller still behaves normally.
+        """
+        if _internal_call and getattr(self.args, "keep_optimizer_last_only", True):
+            return
+        return super().save_model(output_dir=output_dir, _internal_call=_internal_call)
+
     def _save_checkpoint(self, model, trial, metrics=None):
         """Custom checkpoint saving to save only trainable parameters"""
         # Call parent method for other checkpoint data
         super()._save_checkpoint(model, trial)
+
+        # EVERY rank must execute this barrier. A collective that only some ranks call is not
+        # a no-op for the others: NCCL matches collectives by CALL ORDER, not by name, so a
+        # rank-0-only barrier pairs with rank 1's next allreduce, training continues on a
+        # desynchronised communicator, and the watchdog aborts the job ~10 minutes later with
+        # SIGABRT and no useful traceback (observed 2026-08-10: checkpoint written 17:16:47,
+        # abort 17:27:08 -- the 600s NCCL timeout). It belongs here, ABOVE the rank-0 early
+        # return, not inside _prune_resume_state.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
         if not self.is_world_process_zero():
             return
@@ -444,6 +482,99 @@ class ActionImagesTrainer(Trainer):
                 {"checkpoint/saved_step": self.state.global_step, "checkpoint/path": model_save_path},
                 step=self.state.global_step,
             )
+
+        if getattr(self.args, "keep_optimizer_last_only", True):
+            self._prune_resume_state(run_dir, keep=checkpoint_dir)
+
+    def _prune_resume_state(self, run_dir, keep):
+        """Keep resume state only in the NEWEST checkpoint; older ones keep just their weights.
+
+        Measured 2026-08-10 on this machine, one checkpoint directory is 144GB:
+
+            global_stepN/       108G   DeepSpeed ZeRO-2: fp32 master + Adam m/v + grads
+                                       (6.42e9 params x ~16 bytes)
+            pytorch_model.bin    24G   HF's fp32 copy of the model (6.42e9 x 4)
+            stepN.ckpt           12G   DiT-only bf16 -- the ONLY file eval and warm-start read
+
+        A 10k-step run at 250-step cadence therefore wants 5.8TB. A real run filled the shared
+        volume and died mid-write at step 1000, leaving an unusable checkpoint (optimizer
+        shards 0.5% written, no `latest`, no trainer_state.json) -- so this is not a tidiness
+        issue, it is what stops long runs from destroying themselves.
+
+        `pytorch_model.bin` is deleted unconditionally because nothing here reads it:
+        `find_latest_checkpoint` looks for `step{N}.ckpt`, `ActionImagesModel.__init__` loads
+        that `.ckpt`, and DeepSpeed resume reads `global_step*/`.
+
+        Older `global_step*/` are droppable because they only allow resuming from THAT step,
+        and a run resumes from its newest checkpoint. Steady state: 12GB per retained
+        checkpoint, plus ~120GB for the resumable tip.
+        """
+        import glob
+        import shutil
+
+        # No barrier here: this method runs on rank 0 ONLY, so a collective inside it
+        # deadlocks/desynchronises the job (see the note in _save_checkpoint). The
+        # all-ranks barrier that guarantees every shard has landed is already done there.
+        keep = os.path.abspath(keep)
+        freed = 0
+        for ckpt_dir in sorted(glob.glob(os.path.join(run_dir, "checkpoint-*"))):
+            if not os.path.isdir(ckpt_dir):
+                continue
+            if os.path.abspath(ckpt_dir) == keep:
+                # NEVER touch the resume tip. Everything this run might need to restart lives
+                # here, and a half-pruned tip is unrecoverable. Nothing is gained by trimming
+                # it either: `pytorch_model.bin` is no longer written at all (see save_model),
+                # so there is nothing redundant left in it to remove.
+                continue
+            victims = ["pytorch_model.bin", "model.safetensors",
+                       "optimizer.pt", "scheduler.pt", "latest", "zero_to_fp32.py",
+                       "rng_state_0.pth", "rng_state_1.pth"]
+            victims += [os.path.basename(p)
+                        for p in glob.glob(os.path.join(ckpt_dir, "global_step*"))]
+            for name in victims:
+                path = os.path.join(ckpt_dir, name)
+                if not os.path.exists(path):
+                    continue
+                try:
+                    if os.path.isdir(path):
+                        size = sum(os.path.getsize(os.path.join(r, f))
+                                   for r, _, fs in os.walk(path) for f in fs)
+                        shutil.rmtree(path)
+                    else:
+                        size = os.path.getsize(path)
+                        os.remove(path)
+                    freed += size
+                except OSError as e:
+                    # Never let cleanup kill a training run that has otherwise succeeded.
+                    logger.warning(f"could not prune {path}: {e}")
+        if freed:
+            logger.info(f"pruned {freed / 1e9:.1f} GB of redundant checkpoint state "
+                        f"(resume state kept only in {os.path.basename(keep)})")
+
+
+def _latest_resumable_checkpoint(output_dir):
+    """Newest checkpoint-* directory that DeepSpeed can actually resume from, or None.
+
+    "Resumable" is stricter than find_latest_checkpoint's "has a stepN.ckpt": HF's
+    deepspeed_load_checkpoint needs `global_step*/` (the sharded optimizer state) and
+    TrainerState needs `trainer_state.json`. --keep_optimizer_last_only deliberately removes
+    the former from all but the newest checkpoint, so most of the tree is weights-only.
+    """
+    if not os.path.isdir(output_dir):
+        return None
+    best = None
+    for item in os.listdir(output_dir):
+        m = re.fullmatch(r"checkpoint-(\d+)", item)
+        if not m:
+            continue
+        d = os.path.join(output_dir, item)
+        has_state = any(n.startswith("global_step") and os.path.isdir(os.path.join(d, n))
+                        for n in os.listdir(d))
+        if has_state and os.path.exists(os.path.join(d, "trainer_state.json")):
+            step = int(m.group(1))
+            if best is None or step > best[0]:
+                best = (step, d)
+    return best[1] if best else None
 
 
 def train(args: TrainingArguments):
@@ -528,10 +659,29 @@ def train(args: TrainingArguments):
         torch.autograd.set_detect_anomaly(True)
         logger.warning("TORCH_DETECT_ANOMALY is set: autograd anomaly detection ON (training will be much slower).")
 
-    # Start training
-    if args.resume_ckpt_path is not None:
-        trainer.train(resume_from_checkpoint=True)
+    # Start training.
+    # `resume_from_checkpoint=True` makes HF pick the highest-numbered checkpoint-* directory
+    # and hand it to DeepSpeed, which REQUIRES a `global_step*/` inside it. But
+    # find_latest_checkpoint (above) only requires a `stepN.ckpt`, and --keep_optimizer_last_only
+    # strips `global_step*/` from every checkpoint except the newest. So as soon as the newest
+    # checkpoint is removed -- by manual disk cleanup, by a failed write, or by rotation -- the
+    # two disagree, and the run dies with
+    #     ValueError: Can't find a valid checkpoint at .../checkpoint-250
+    # even though the WEIGHTS at that step loaded fine a moment earlier (observed 2026-08-10).
+    # Resolve the disagreement here: resume optimizer state only from a directory that really
+    # has it, and otherwise continue from the weights alone rather than refusing to start.
+    resumable = _latest_resumable_checkpoint(args.output_dir)
+    if resumable is not None:
+        logger.info(f"resuming optimizer/scheduler state from {resumable}")
+        trainer.train(resume_from_checkpoint=resumable)
     else:
+        if args.resume_ckpt_path is not None:
+            logger.warning(
+                f"{args.resume_ckpt_path} gives the WEIGHTS, but no checkpoint directory under "
+                f"{args.output_dir} still has DeepSpeed resume state (global_step*/). Continuing "
+                f"from those weights with a fresh optimizer and step counter. Reported step "
+                f"numbers will restart from 0 -- account for that when plotting against step."
+            )
         trainer.train()
 
     # Save final model (only on rank 0)
