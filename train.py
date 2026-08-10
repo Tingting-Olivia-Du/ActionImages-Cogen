@@ -472,6 +472,34 @@ class ActionImagesTrainer(Trainer):
             return loss, outputs
         return loss
 
+    def save_model(self, output_dir=None, _internal_call=False):
+        """Skip HF's fp32 `pytorch_model.bin` during checkpointing -- do not write it at all.
+
+        Pruning it after the fact was not enough. On 2026-08-10 arm1 died at checkpoint-750
+        with
+
+            PytorchStreamWriter failed writing file data/4: file write failed
+            unexpected pos 25662237504 vs 25662237336
+            OSError: [Errno 28] No space left on device
+
+        -- 25,662,237,504 bytes is exactly `pytorch_model.bin`. The volume filled up WHILE
+        writing a 25.6GB file that `_prune_resume_state` deletes seconds later. Writing then
+        deleting only reclaims space; it still requires the space to exist first, so on a
+        tight volume the write itself is what kills the run.
+
+        `_save_checkpoint` calls this (transformers 4.57.3, line 13 of its body) and then
+        calls `_save_optimizer_and_scheduler` SEPARATELY (line 33), which is what writes
+        DeepSpeed's `global_step*/`. Suppressing this call therefore costs nothing that
+        resume needs, and the weights are still saved -- as the DiT-only bf16 `stepN.ckpt`
+        that `_save_checkpoint` writes below and that everything here actually reads.
+
+        Only the internal checkpointing call is suppressed; an explicit `save_model()` by a
+        caller still behaves normally.
+        """
+        if _internal_call and getattr(self.args, "keep_optimizer_last_only", True):
+            return
+        return super().save_model(output_dir=output_dir, _internal_call=_internal_call)
+
     def _save_checkpoint(self, model, trial, metrics=None):
         """Custom checkpoint saving to save only trainable parameters"""
         # Call parent method for other checkpoint data

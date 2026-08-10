@@ -17,6 +17,7 @@ export TOKENIZERS_PARALLELISM=false
 
 TESTS=(
   tests/test_forward_unchanged.py     # assembly reproduces upstream, per decision path
+  tests/test_checkpoint_pruning.py    # collective symmetry (2 gloo ranks) + what survives
   tests/test_depth_codec.py           # depth GT <-> RGB roundtrip
   tests/test_seg_codec.py             # seg GT <-> RGB roundtrip
   tests/test_prompt_tags.py           # every template tag survives scrub + tokenizer

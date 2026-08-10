@@ -9,7 +9,10 @@ Two orthogonal axes decide what a training sample teaches (see
           Action-Images' own switch (i2va / a2v / v2a / video-only, paper §3.3).
 
 "Perception" in the papers' sense is not a modality, it is a (Pi, mask) pair:
-Pi = {video, depth} with the video segments FULLY given. That is why the fork's earlier
+Pi = {video, depth} with the video segments FULLY given. 
+do we need i2vd, (d2v), v2d
+
+That is why the fork's earlier
 substitution layout (`[v1_depth | v1_action | v2_depth | v2_action]`) could not express it --
 there was no RGB anywhere in the sequence, so nothing could be "read off" it. That layout is
 still available as the `depth+action` template, but it is a depth-space world model, not
