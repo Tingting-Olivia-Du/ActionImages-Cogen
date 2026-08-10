@@ -75,7 +75,7 @@ fi
 GPUS="${GPUS:-4,7}"
 SEED="${SEED:-42}"
 RES="${RES:-256}"
-PORT="${PORT:-29551}"
+PORT="${PORT:-29559}"
 VARIATIONS="${VARIATIONS:-0}"   # 训练只看 variation0;其余 variation 是留出测试集
 SLUG="$(echo "$ARM" | tr -c '[:alnum:]+' '_')"
 OUT="${OUT:-$REPO/outputs/${SLUG}_seed${SEED}}"

@@ -72,6 +72,12 @@ from training.templates import (
 # the parent class' RGB path; the rest go through `_encode_perception`.
 PERCEPTION_MODALITIES = tuple(m for m in VISUAL_MODALITIES if m != "video")
 
+# Above this fraction of episodes lacking seg_targets.json, a segmentation template is not
+# training what its command line says and the run is refused rather than warned about. 10% is
+# well above the ~1% of genuinely un-annotatable episodes in the original tree, and far below
+# the 70% that a round of episode generation produced.
+SEG_COVERAGE_MIN_MISSING_TO_RAISE = 0.10
+
 
 class RLBenchSelfgenDataset(RLBenchMVDataset):
     """RLBench selfgen episodes; `template_mix` picks which task template each sample teaches."""
@@ -112,7 +118,54 @@ class RLBenchSelfgenDataset(RLBenchMVDataset):
         BaseDataset.__init__(self, *args, **kwargs)
 
         self._apply_variation_filter()
+        self._check_seg_coverage()
         self._self_test()
+
+    def _check_seg_coverage(self) -> None:
+        """Refuse to silently train a seg template on episodes that have no seg ground truth.
+
+        `seg_targets.json` is produced OFFLINE by ttd's `src/percep/seg_targets_gen.py`, not by
+        the episode generator. So every episode `gen_dataset.py` adds arrives without it, and
+        `_referred_id_groups` returns nothing for those -- at which point `getitem` drops
+        `segmentation` from the template and the sample silently becomes a plain `video` one.
+
+        That failure is invisible in every other instrument: loss looks normal, `_self_test`
+        passes (it probes episodes until one works), and the run's own logs say the mix is
+        whatever was on the command line. Measured 2026-08-10, 70% of variation0 episodes had
+        no seg_targets.json (97% of the newly generated ones), which turned a nominal
+        60/20/20 mix into roughly 60% action / 20% depth / 6% seg / 14% VIDEO-ONLY. Those
+        video-only samples carry neither action nor perception supervision, so an arm that
+        hits this is not comparable to a control arm that does not.
+        """
+        if not any("segmentation" in mods for mods in self._templates):
+            return
+        missing = [ep["path"] for ep in self.episodes
+                   if not os.path.exists(os.path.join(ep["path"], "seg_targets.json"))]
+        if not missing:
+            print(f"[selfgen] seg coverage OK: {len(self.episodes)}/{len(self.episodes)} "
+                  f"episodes carry seg_targets.json")
+            return
+        frac = len(missing) / max(len(self.episodes), 1)
+        # parse_template_mix returns CUMULATIVE probabilities; recover the per-template share.
+        prev = 0.0
+        seg_weight = 0.0
+        for mods, cum in zip(self._templates, self._template_cum):
+            if "segmentation" in mods:
+                seg_weight += cum - prev
+            prev = cum
+        msg = (
+            f"{len(missing)}/{len(self.episodes)} episodes ({frac:.1%}) have no "
+            f"seg_targets.json, e.g. {missing[0]}.\n"
+            f"  Those samples DROP segmentation and become plain `video` samples -- silently.\n"
+            f"  With seg weight {seg_weight:.0%} in template_mix, about {seg_weight * frac:.1%} "
+            f"of ALL training samples become video-only (no action, no perception), which is a\n"
+            f"  confound a control arm does not share.\n"
+            f"  Fix: run ttd's src/percep/seg_targets_gen.py over the tree, or drop the "
+            f"segmentation template from --template_mix."
+        )
+        if frac > SEG_COVERAGE_MIN_MISSING_TO_RAISE:
+            raise RuntimeError("[selfgen] seg coverage too low: " + msg)
+        print("[selfgen] WARNING: partial seg coverage: " + msg)
 
     def _apply_variation_filter(self) -> None:
         """Keep only the variations this split is allowed to see.
