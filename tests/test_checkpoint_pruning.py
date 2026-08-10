@@ -12,9 +12,11 @@ Two independent failure modes, both of which have actually happened here:
    test_negative_control_buggy_order proves the test can detect the bug by reproducing the
    old ordering and requiring it to hang.
 
-2. PRUNING THE WRONG FILES. The resume tip must keep `global_step*/`, every checkpoint must
-   keep its `stepN.ckpt` (that is what eval and warm-start read), and `pytorch_model.bin`
-   must always go (24GB that nothing in this codebase reads).
+2. PRUNING THE WRONG FILES. The newest checkpoint is the resume tip and is left ENTIRELY
+   untouched -- a half-pruned tip is unrecoverable, and there is nothing redundant left in it
+   anyway now that `pytorch_model.bin` is never written (the save_model override). Every
+   OLDER checkpoint keeps its `stepN.ckpt` (what eval and warm-start read) and loses its
+   `global_step*/` (resume state for a step nothing will resume from).
 
 Run: python /workspace/ttdu/ActionImages-Cogen/tests/test_checkpoint_pruning.py
 """
@@ -156,11 +158,14 @@ def test_pruning_keeps_the_right_files():
             assert "pytorch_model.bin" not in got, f"redundant fp32 copy kept in {d}"
             print(f"  checkpoint-{step:<4} pruned to {got}")
 
+        # The resume tip is left ENTIRELY untouched -- a half-pruned tip is unrecoverable,
+        # and there is nothing redundant in it anyway now that pytorch_model.bin is never
+        # written (save_model override).
         got = sorted(os.listdir(newest))
-        assert "global_step750" in got, f"resume tip lost its optimizer state: {got}"
-        assert "step750.ckpt" in got, got
-        assert "pytorch_model.bin" not in got, "pytorch_model.bin is never needed, even newest"
-        print(f"  checkpoint-750  (NEWEST) keeps {got}")
+        for required in ("global_step750", "step750.ckpt", "trainer_state.json",
+                         "scheduler.pt", "latest", "rng_state_0.pth"):
+            assert required in got, f"resume tip lost {required}: {got}"
+        print(f"  checkpoint-750  (NEWEST) untouched, keeps {got}")
         print("PRUNING_FILE_SELECTION_OK")
     finally:
         shutil.rmtree(root, ignore_errors=True)

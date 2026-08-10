@@ -72,7 +72,7 @@ if [ -z "${WANDB_API_KEY:-}" ]; then
   exit 4
 fi
 
-GPUS="${GPUS:-1,4}"
+GPUS="${GPUS:-1,2}"
 SEED="${SEED:-42}"
 RES="${RES:-256}"
 PORT="${PORT:-29556}"

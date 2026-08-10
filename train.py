@@ -587,14 +587,18 @@ class ActionImagesTrainer(Trainer):
         for ckpt_dir in sorted(glob.glob(os.path.join(run_dir, "checkpoint-*"))):
             if not os.path.isdir(ckpt_dir):
                 continue
-            is_newest = os.path.abspath(ckpt_dir) == keep
-            victims = ["pytorch_model.bin", "model.safetensors"]
-            if not is_newest:
-                # Resume state for a step nothing will resume from.
-                victims += ["optimizer.pt", "scheduler.pt", "latest", "zero_to_fp32.py",
-                            "rng_state_0.pth", "rng_state_1.pth"]
-                victims += [os.path.basename(p)
-                            for p in glob.glob(os.path.join(ckpt_dir, "global_step*"))]
+            if os.path.abspath(ckpt_dir) == keep:
+                # NEVER touch the resume tip. Everything this run might need to restart lives
+                # here, and a half-pruned tip is unrecoverable. Nothing is gained by trimming
+                # it either: `pytorch_model.bin` is no longer written at all (see save_model),
+                # so there is nothing redundant left in it to remove.
+                continue
+            # Resume state for a step nothing will resume from.
+            victims = ["pytorch_model.bin", "model.safetensors",
+                       "optimizer.pt", "scheduler.pt", "latest", "zero_to_fp32.py",
+                       "rng_state_0.pth", "rng_state_1.pth"]
+            victims += [os.path.basename(p)
+                        for p in glob.glob(os.path.join(ckpt_dir, "global_step*"))]
             for name in victims:
                 path = os.path.join(ckpt_dir, name)
                 if not os.path.exists(path):
@@ -614,6 +618,31 @@ class ActionImagesTrainer(Trainer):
         if freed:
             logger.info(f"pruned {freed / 1e9:.1f} GB of redundant checkpoint state "
                         f"(resume state kept only in {os.path.basename(keep)})")
+
+
+def _latest_resumable_checkpoint(output_dir):
+    """Newest checkpoint-* directory that DeepSpeed can actually resume from, or None.
+
+    "Resumable" is stricter than find_latest_checkpoint's "has a stepN.ckpt": HF's
+    deepspeed_load_checkpoint needs `global_step*/` (the sharded optimizer state) and
+    TrainerState needs `trainer_state.json`. --keep_optimizer_last_only deliberately removes
+    the former from all but the newest checkpoint, so most of the tree is weights-only.
+    """
+    if not os.path.isdir(output_dir):
+        return None
+    best = None
+    for item in os.listdir(output_dir):
+        m = re.fullmatch(r"checkpoint-(\d+)", item)
+        if not m:
+            continue
+        d = os.path.join(output_dir, item)
+        has_state = any(n.startswith("global_step") and os.path.isdir(os.path.join(d, n))
+                        for n in os.listdir(d))
+        if has_state and os.path.exists(os.path.join(d, "trainer_state.json")):
+            step = int(m.group(1))
+            if best is None or step > best[0]:
+                best = (step, d)
+    return best[1] if best else None
 
 
 def train(args: TrainingArguments):
@@ -720,10 +749,29 @@ def train(args: TrainingArguments):
         torch.autograd.set_detect_anomaly(True)
         logger.warning("TORCH_DETECT_ANOMALY is set: autograd anomaly detection ON (training will be much slower).")
 
-    # Start training
-    if args.resume_ckpt_path is not None:
-        trainer.train(resume_from_checkpoint=True)
+    # Start training.
+    # `resume_from_checkpoint=True` makes HF pick the highest-numbered checkpoint-* directory
+    # and hand it to DeepSpeed, which REQUIRES a `global_step*/` inside it. But
+    # find_latest_checkpoint (above) only requires a `stepN.ckpt`, and --keep_optimizer_last_only
+    # strips `global_step*/` from every checkpoint except the newest. So as soon as the newest
+    # checkpoint is removed -- by manual disk cleanup, by a failed write, or by rotation -- the
+    # two disagree, and the run dies with
+    #     ValueError: Can't find a valid checkpoint at .../checkpoint-250
+    # even though the WEIGHTS at that step loaded fine a moment earlier (observed 2026-08-10).
+    # Resolve the disagreement here: resume optimizer state only from a directory that really
+    # has it, and otherwise continue from the weights alone rather than refusing to start.
+    resumable = _latest_resumable_checkpoint(args.output_dir)
+    if resumable is not None:
+        logger.info(f"resuming optimizer/scheduler state from {resumable}")
+        trainer.train(resume_from_checkpoint=resumable)
     else:
+        if args.resume_ckpt_path is not None:
+            logger.warning(
+                f"{args.resume_ckpt_path} gives the WEIGHTS, but no checkpoint directory under "
+                f"{args.output_dir} still has DeepSpeed resume state (global_step*/). Continuing "
+                f"from those weights with a fresh optimizer and step counter. Reported step "
+                f"numbers will restart from 0 -- account for that when plotting against step."
+            )
         trainer.train()
 
     # Save final model (only on rank 0)
