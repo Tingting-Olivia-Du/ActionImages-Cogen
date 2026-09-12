@@ -11,6 +11,9 @@ from training.helpers.io import load_video_frames
 
 
 class DROIDMVDataset(BaseDataset):
+    # Real metric actions + cam2base calibration, but no depth/segmentation GT.
+    AVAILABLE_MODALITIES = ("video", "action")
+
     """
     DROID multi-view dataset implementation.
 
@@ -95,10 +98,45 @@ class DROIDMVDataset(BaseDataset):
           - "actions"
         Each should be shaped [T, 7]. If shape differs, attempts simple fixes.
         """
-        actions = np.load(action_npz_path)["action"]
-        # HACK: now it is of shape (T, 6)
-        actions = np.concatenate([actions, np.ones((actions.shape[0], 1))], axis=1)
+        with np.load(action_npz_path) as payload:
+            if "action" not in payload:
+                raise KeyError(f"{action_npz_path} has no 'action' array (found {payload.files})")
+            pose = np.asarray(payload["action"])  # [T, 6] xyz + intrinsic-xyz euler, robot base
+            if "gripper" not in payload:
+                # Refuse to fall back to a constant. A constant 7th channel is invisible in the
+                # loss and in any all-zeros check, so it would silently teach "gripper never
+                # moves" for every DROID step. Re-run scripts/preprocess_droid.py.
+                raise KeyError(
+                    f"{action_npz_path} has no 'gripper' array (found {payload.files}). "
+                    f"Re-run scripts/preprocess_droid.py; the loader will not substitute a "
+                    f"constant openness."
+                )
+            gripper = np.asarray(payload["gripper"]).reshape(-1)
 
+        if pose.ndim != 2 or pose.shape[1] != 6:
+            raise ValueError(f"{action_npz_path}: expected action [T, 6], got {pose.shape}")
+        if gripper.shape[0] != pose.shape[0]:
+            raise ValueError(
+                f"{action_npz_path}: gripper has {gripper.shape[0]} frames but action has "
+                f"{pose.shape[0]}"
+            )
+        if not np.isfinite(pose).all() or not np.isfinite(gripper).all():
+            raise ValueError(f"{action_npz_path}: non-finite action or gripper values")
+
+        # DROID `observation/robot_state/gripper_position` is 0 = fully OPEN, 1 = fully closed.
+        # Action-Images' 7th channel is OPENNESS with the opposite polarity (1 = open, 0 = grasp;
+        # see the README's --view1_action table), which is also what RLBench's actions[:, 7]
+        # carries. Measured on this data tree: DROID episodes start at gripper 0.000 while
+        # RLBench episodes start at openness 1.000, and a pick-and-place episode reads
+        # 0 -> 0.58 -> 0 (closed only while transporting). Concatenating gripper verbatim would
+        # therefore train the channel exactly backwards -- worse than the constant it replaces.
+        openness = 1.0 - np.clip(gripper, 0.0, 1.0)
+
+        # float64 deliberately: the caller pairs this with float64 extrinsics/intrinsics, and
+        # project_point_3d_to_2d_torch_batch einsums them together without casting.
+        actions = np.concatenate(
+            [pose.astype(np.float64), openness[:, None].astype(np.float64)], axis=1
+        )
         actions = actions[frame_indices]
         return actions
 

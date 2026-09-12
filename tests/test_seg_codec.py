@@ -129,8 +129,12 @@ print("BUILD_SEG_PROMPT_OK")
 # retired task_objects.TASK_INSTANCES substring table ---
 import os
 
-# repo_root/data/rlbench_selfgen -> the selfgen tree (see FORK_CHANGES.md)
-_SELFGEN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "rlbench_selfgen")
+# 512_aug, not the bare "rlbench_selfgen" symlink: that one points at the deleted 256 v2 tree
+# and DANGLES, so this check has been skipping itself silently. SELFGEN_TEST_DATA overrides.
+_SELFGEN = os.environ.get(
+    "SELFGEN_TEST_DATA",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "data", "rlbench_selfgen_512_aug"))
 from training.percep.seg_codec import build_referring_spec, encode_known_color, decode_known_color
 
 candidates = [

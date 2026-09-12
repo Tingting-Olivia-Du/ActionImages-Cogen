@@ -33,7 +33,16 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from training.templates import assemble, parse_template, plan_segments  # noqa: E402
+from training.templates import (  # noqa: E402
+    ACTION_MASK_MIX_PRESETS,
+    MODE_ALL_VISUAL_GIVEN_PROB,
+    MODE_FIRST_SEGMENT_GIVEN_PROB,
+    SINGLE_FRAME_VISUAL_PROB,
+    assemble,
+    parse_action_mask_mix,
+    parse_template,
+    plan_segments,
+)
 
 B, C, T_L, H, W = 1, 4, 3, 2, 2
 
@@ -196,17 +205,23 @@ def test_never_fully_conditioned():
     import random as _r
 
     torch.manual_seed(5)
-    lat = {m: [_lat(), _lat()] for m in ("video", "depth", "segmentation", "action")}
+    lat = {m: [_lat(), _lat()] for m in
+           ("video", "depth", "segmentation", "normal", "action")}
     cam = [_cam(), _cam()]
     names = ["video", "video+action", "video+depth", "video+segmentation",
-             "video+depth+action", "depth+action", "video+depth+segmentation+action"]
+             "video+depth+action", "depth+action", "video+depth+segmentation+action",
+             # arm7's menu. A mask mix is only safe if NO setting of it can produce a fully
+             # conditioned sequence, so sweep every preset, not just the default.
+             "segmentation+action", "normal+action"]
     rng = _r.Random(0)
-    for name, _ in itertools.product(names, range(40)):
+    mixes = [None] + [parse_action_mask_mix(k) for k in sorted(ACTION_MASK_MIX_PRESETS)]
+    for name, amm, _ in itertools.product(names, mixes, range(20)):
         mods = parse_template(name)
         for is_rlbench in (True, False):
-            plan = plan_segments(mods, num_views=2, rng=rng, is_rlbench=is_rlbench)
+            plan = plan_segments(mods, num_views=2, rng=rng, is_rlbench=is_rlbench,
+                                 action_mask_mix=amm)
             _, _, masks = assemble(plan, lat, cam)   # asserts internally
-            assert (~masks).any(), name
+            assert (~masks).any(), (name, amm)
     print("NEVER_FULLY_CONDITIONED_OK")
 
 
@@ -310,6 +325,90 @@ def test_substitution_template_still_reachable():
     print("SUBSTITUTION_TEMPLATE_OK")
 
 
+def test_action_mask_mix_a0_is_the_upstream_default():
+    """The A axis must be a no-op at its default, on EVERY decision path.
+
+    `plan_segments` inverts the (iiii, fiii, fifi, policy) marginal back into the two
+    thresholds upstream actually compares against. If that arithmetic drifts, A0 stops meaning
+    "upstream" -- and nothing else would notice, because the marginal would still look right in
+    aggregate while individual seeds started landing in different branches. So compare the two
+    at the threshold BOUNDARIES, where an off-by-epsilon shows up as a different plan.
+    """
+    a0 = ACTION_MASK_MIX_PRESETS["A0"]
+    # The derived thresholds must be the upstream literals to full float precision, not just
+    # close: `p < t` at exactly t is the boundary these fixtures probe.
+    rest = 1.0 - a0[3]
+    assert a0[3] == SINGLE_FRAME_VISUAL_PROB, a0
+    assert a0[0] / rest == MODE_FIRST_SEGMENT_GIVEN_PROB, a0
+    assert (a0[0] + a0[1]) / rest == MODE_ALL_VISUAL_GIVEN_PROB, a0
+
+    torch.manual_seed(11)
+    lat = {m: [_lat(), _lat()] for m in ("video", "depth", "segmentation", "normal", "action")}
+    cam = [_cam(), _cam()]
+    # Values that straddle every boundary in both draws, including the exact thresholds.
+    draws = (0.0, 0.05, 0.099999, 0.1, 0.5, 0.899999, 0.9, 0.93, 0.949999, 0.95, 0.99)
+    for name in ("video+action", "depth+action", "segmentation+action", "normal+action"):
+        mods = parse_template(name)
+        for d0 in draws:
+            for d1 in draws:
+                for is_rlbench in (True, False):
+                    default = assemble(plan_segments(
+                        mods, 2, rng=ScriptedRandom([d0, d1]), is_rlbench=is_rlbench), lat, cam)
+                    explicit = assemble(plan_segments(
+                        mods, 2, rng=ScriptedRandom([d0, d1]), is_rlbench=is_rlbench,
+                        action_mask_mix=a0), lat, cam)
+                    _same(f"{name} A0 vs default @({d0},{d1},rlbench={is_rlbench})",
+                          explicit, default)
+    print("ACTION_MASK_MIX_A0_IS_UPSTREAM_OK")
+
+
+def test_action_mask_mix_a1_reaches_every_branch():
+    """arm7's A1 = (iiii .75, fiii 0, fifi .05, policy .20).
+
+    Two properties that a marginal alone does not pin down: policy mode must fire on the LOW
+    end of the first draw (upstream's ordering -- a mix that inverted it would train a
+    different sequence from the same seed), and FIII must be UNREACHABLE at weight zero rather
+    than merely rare.
+    """
+    a1 = parse_action_mask_mix("A1")
+    mods = parse_template("depth+action")
+
+    plan = plan_segments(mods, 2, rng=ScriptedRandom([0.19]), is_rlbench=True, action_mask_mix=a1)
+    assert all(s.single_frame for s in plan if s.modality == "depth"), plan
+    assert not any(s.single_frame for s in plan if s.modality == "action"), plan
+
+    # 0.20 is the boundary: `<` means it belongs to the second draw, not to policy mode.
+    plan = plan_segments(mods, 2, rng=ScriptedRandom([0.20, 0.5]), is_rlbench=True,
+                         action_mask_mix=a1)
+    assert not any(s.single_frame for s in plan), plan
+    assert not any(s.fully_given for s in plan), plan          # IIII
+
+    # p_fiii == 0 collapses the two thresholds, so no second-draw value can select FIII.
+    for d1 in (0.0, 0.5, 0.937499, 0.9375, 0.93751, 0.99, 0.999999):
+        plan = plan_segments(mods, 2, rng=ScriptedRandom([0.5, d1]), is_rlbench=True,
+                             action_mask_mix=a1)
+        given = [s.modality for s in plan if s.fully_given]
+        assert given in ([], ["depth", "depth"]), (d1, given)  # IIII or FIFI, never FIII
+    print("ACTION_MASK_MIX_A1_OK")
+
+
+def test_arm7_substitution_layouts():
+    """`segmentation+action` and `normal+action` lay out as `S0|A0|S1|A1` / `N0|A0|N1|A1`.
+
+    The decoder in eval/eval_action.py slices the action segments at index 1 and 3 for all four
+    of arm7's templates. That is only true while the action segment stays last within a view,
+    so pin it for the two modalities arm7 introduces.
+    """
+    for modality, mix in (("segmentation", None), ("normal", parse_action_mask_mix("A1"))):
+        plan = plan_segments(parse_template(f"{modality}+action"), num_views=2,
+                             rng=ScriptedRandom([0.5, 0.5]), is_rlbench=True,
+                             action_mask_mix=mix)
+        assert [(s.view, s.modality) for s in plan] == [
+            (0, modality), (0, "action"), (1, modality), (1, "action")
+        ], (modality, plan)
+    print("ARM7_SUBSTITUTION_LAYOUTS_OK")
+
+
 def test_rejects_malformed_templates():
     for bad in (
         "",                # nothing
@@ -337,6 +436,9 @@ def main():
     test_perception_template_gives_rgb_whole()
     test_cogeneration_template_is_six_segments()
     test_substitution_template_still_reachable()
+    test_action_mask_mix_a0_is_the_upstream_default()
+    test_action_mask_mix_a1_reaches_every_branch()
+    test_arm7_substitution_layouts()
     test_rejects_malformed_templates()
     print("ALL_FORWARD_UNCHANGED_TESTS_PASSED")
 

@@ -4,6 +4,7 @@ invalid-value handling.
 
 Run: python /workspace/ttdu/ActionImages-Cogen/tests/test_depth_codec.py
 """
+import os
 import sys
 from pathlib import Path
 
@@ -131,8 +132,10 @@ print("STRICT_API_AND_DOMAIN_OK")
 
 # --- 5. real selfgen episode (if present) ---
 import glob
-# repo_root/data/rlbench_selfgen is the symlink to the selfgen tree (see FORK_CHANGES.md)
-data_root = Path(__file__).resolve().parents[1] / "data" / "rlbench_selfgen"
+# 512_aug, not the bare "rlbench_selfgen" symlink: that one points at the deleted 256 v2 tree
+# and DANGLES, so this check has been skipping itself silently. SELFGEN_TEST_DATA overrides.
+data_root = Path(os.environ.get(
+    "SELFGEN_TEST_DATA", Path(__file__).resolve().parents[1] / "data" / "rlbench_selfgen_512_aug"))
 paths = sorted(glob.glob(str(data_root / "*" / "variation0" / "episodes" / "episode0" / "view1" / "depth.npz")))
 if paths:
     errs = []

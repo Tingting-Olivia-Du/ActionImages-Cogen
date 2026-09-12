@@ -1,0 +1,256 @@
+% Drop-in section fragment for iclr2026_cogen.tex.
+% Required preamble: \input{math.tex}, natbib (loaded by iclr.sty), and hyperref/url.
+
+\section{Preliminaries}
+\label{sec:prelim}
+
+We first specify the latent video backbone, the pixel-space action representation, and the
+masked flow-matching objective shared by all task templates. We use $n$ for physical video time
+and $k$ for an index in the discrete flow-matching schedule. A single noise level is sampled per
+local forward pass and shared by every view and modality segment in the packed sequence. This
+differs from UWM \citep{zhu2025unified}, which assigns independently sampled diffusion times to
+its action and future-observation streams.
+
+\subsection{Latent video backbone and camera conditioning}
+\label{sec:prelim-backbone}
+
+\paragraph{Video latent space.}
+We instantiate the dense Wan2.2-TI2V-5B video diffusion transformer
+\citep{wan2025,wan2025wan22}. Its causal 3D VAE encoder and decoder are denoted by $\gE$ and
+$\gD$ and remain frozen. For admissible clips with $T=4q+1$ frames and spatial dimensions
+divisible by $16$, the encoder maps
+\begin{equation}
+    \gE:\ \R^{3\times T\times H\times W}
+    \longrightarrow
+    \R^{C_l\times T_l\times H_l\times W_l},
+    \qquad
+    T_l=1+\frac{T-1}{4},\quad
+    H_l=\frac{H}{16},\quad
+    W_l=\frac{W}{16}.
+    \label{eq:prelim-vae}
+\end{equation}
+For a general number of frames, the implementation uses
+$T_l=1+\floor{(T-1)/4}$. The arm6 configuration uses $T=41$, $H=W=512$, and $C_l=48$, hence
+$T_l\times H_l\times W_l=11\times32\times32$. We optimize all parameters of the denoising
+transformer, including its camera-conditioning modules, while keeping the VAE and text encoder
+fixed.
+
+\paragraph{Absolute and relative cameras.}
+Each example contains $V=2$ sampled views. Let
+$\mK_{v,n}\in\R^{3\times3}$ and $\mE_{v,n}\in SE(3)$ be the intrinsics and absolute
+camera-to-world extrinsics for view $v$ at frame $n$. They define the world-to-pixel projection
+$\pi_{v,n}:\R^3\to\R^2$ by inverting $\mE_{v,n}$ before perspective projection. The arm6 cameras
+are static within a trajectory, but we retain $n$ because the data interface supports per-frame
+calibration.
+
+The camera tensor supplied to the transformer is constructed from a different pose sequence.
+Let $\mE_{0,1}$ denote the first frame of the first sampled (conditioning) view. We express every
+camera in that coordinate system as
+\begin{equation}
+    \bar{\mE}_{v,n}=\mE_{0,1}^{-1}\mE_{v,n}=[\bar{\mR}_{v,n}\mid\bar{\vt}_{v,n}].
+    \label{eq:prelim-relative-camera}
+\end{equation}
+For a pixel $\vx=(u,v)$, let
+$\vd^{\mathrm{cam}}_{v,n,\vx}\propto\mK_{v,n}^{-1}(u+\tfrac12,v+\tfrac12,1)^{\top}$.
+The corresponding world-frame ray has unit direction and Pl\"ucker moment
+\begin{equation}
+    \vd_{v,n,\vx}
+    =\frac{\bar{\mR}_{v,n}\vd^{\mathrm{cam}}_{v,n,\vx}}
+           {\|\bar{\mR}_{v,n}\vd^{\mathrm{cam}}_{v,n,\vx}\|_2},
+    \qquad
+    \vm_{v,n,\vx}=\bar{\vt}_{v,n}\times\vd_{v,n,\vx},
+    \label{eq:prelim-plucker}
+\end{equation}
+which gives a six-channel ray map $(\vd,\vm)$ \citep{sitzmann2021lfn}. Following the camera
+pathway of Action Images \citep{zhen2026action}, itself derived from camera-controlled video
+generation \citep{bai2025recammaster}, we VAE-encode the direction and scaled-moment videos
+separately and concatenate them:
+\begin{equation}
+    \tC^{(v)}
+    =\operatorname{Concat}_{\mathrm{ch}}
+      \left[\gE(\vd^{(v)}),\ \gE(\vm^{(v)}/3)\right]
+    \in\R^{2C_l\times T_l\times H_l\times W_l}.
+    \label{eq:prelim-camera-latent}
+\end{equation}
+The factor $1/3$ is part of the implementation and must be retained to reproduce the numerical
+input scale. The camera latent for a view is repeated for every modality segment occupying
+that view. At each packed latent-time position, every transformer block adaptively pools the
+$2C_l\times H_l\times W_l$ camera descriptor to $48\times16\times16$, flattens it, projects it
+to the hidden dimension, and adds it before self-attention. At module construction the encoder
+projection is zero and the final attention projector is the identity, so the augmented block is
+initially identical to the pretrained block. Arm6, however, is warm-started from the released
+Action Images checkpoint; its optimization therefore begins from the camera weights stored in
+that checkpoint rather than from the construction-time zero initialization.
+
+The distinction between $\bar{\mE}_{v,n}$ and $\mE_{v,n}$ is essential: relative poses generate
+the camera-conditioning tensor in \eqref{eq:prelim-camera-latent}, whereas absolute camera-to-world
+extrinsics define $\pi_{v,n}$ for rendering and decoding action images.
+
+\subsection{Actions as images}
+\label{sec:prelim-actionimages}
+
+An RLBench action at frame $n$ comprises an end-effector position $\vp_n\in\R^3$, a rotation
+$\mR_n\in SO(3)$ obtained from the stored $xyz$ Euler angles, and a binary gripper state
+$g_n\in\{0,1\}$. The renderer first constructs three world-space points. We write them using the
+channel order implemented by the released code:
+\begin{equation}
+    \vq^{(R)}_n=\vp_n,
+    \qquad
+    \vq^{(G)}_n=\vp_n+\ell\mR_n\ve_x,
+    \qquad
+    \vq^{(B)}_n=\vp_n-\ell\mR_n\ve_z,
+    \qquad \ell=0.1\ \mathrm{m},
+    \label{eq:prelim-actionpoints}
+\end{equation}
+where $\ve_x=(1,0,0)^{\top}$ and $\ve_z=(0,0,1)^{\top}$. This is geometrically the same
+three-point representation as Action Images \citep{zhen2026action}; the implementation permutes
+the paper's semantic names for the green and blue axis points, and the decoder below follows the
+implemented channel order.
+
+For each view, the points are projected with the absolute calibration,
+$\vu^{(c,v)}_n=\pi_{v,n}(\vq^{(c)}_n)$ for $c\in\{R,G,B\}$. Each projection is rasterized as an
+isotropic Gaussian:
+\begin{equation}
+    \tilde A^{(v)}_{c,n,\vx}
+    =\exp\!\left(-\frac{\|\vx-\vu^{(c,v)}_n\|_2^2}{2\sigma^2}\right),
+    \qquad
+    \sigma=0.05\min(H,W),
+    \label{eq:prelim-actionimage}
+\end{equation}
+where $\vx$ ranges over pixel coordinates. Gripper openness is placed in the low-response
+background of the blue channel, following Eq.~(5) of \citet{zhen2026action}:
+\begin{equation}
+    A^{(v)}_{B,n,\vx}=
+    \begin{cases}
+        \tilde A^{(v)}_{B,n,\vx},
+        & \tilde A^{(v)}_{B,n,\vx}>\tfrac14,\\[2pt]
+        \tfrac14\,\1_{g_n>1/2},
+        & \tilde A^{(v)}_{B,n,\vx}\leq\tfrac14,
+    \end{cases}
+    \qquad
+    A^{(v)}_{R,n}=\tilde A^{(v)}_{R,n},\quad
+    A^{(v)}_{G,n}=\tilde A^{(v)}_{G,n}.
+    \label{eq:prelim-openness}
+\end{equation}
+Thus $\tA^{(v)}\in[0,1]^{3\times T\times H\times W}$ is an ordinary three-channel video. It is
+mapped to the frozen VAE range and encoded as
+\begin{equation}
+    \tZ^{(\mathrm{action},v)}=\gE(2\tA^{(v)}-1).
+    \label{eq:prelim-action-latent}
+\end{equation}
+Rendering occurs inside the model forward pass: one calibrated 3D trajectory produces aligned
+action videos in both views without additional per-view 2D action annotations.
+
+\paragraph{Action decoding.}
+The original Action Images decoder triangulates every point by selecting a heatmap centroid in a
+principal view, sweeping depths along its camera ray, and scoring the reprojected candidates in
+the remaining view. We retain that procedure for the red position point. For the two orientation
+points, the arm6 evaluation and policy paths use the known axis length to avoid the degeneracy of
+a depth sweep when an axis is foreshortened. Given a decoded position $\hat\vq^{(R)}_n$, we search
+unit directions $\{\vd_j\}_{j=1}^{D}$ on the sphere and select
+\begin{equation}
+    \hat\vq^{(c)}_n
+    =\hat\vq^{(R)}_n+\ell\vd_{j^*},
+    \qquad
+    j^*=\argmax_j\prod_{v=0}^{V-1}
+    H^{(c,v)}_n\!\left(
+        \pi_{v,n}(\hat\vq^{(R)}_n+\ell\vd_j)
+    \right),
+    \quad c\in\{G,B\}.
+    \label{eq:prelim-sphere-decoder}
+\end{equation}
+The current solver uses $D=16384$ approximately uniform directions. Reported arm6 diagnostics
+decode the position with $512$ depth samples over $[0.6,1.8]$ metres and use
+\eqref{eq:prelim-sphere-decoder} for both axes. The paper's all-ray decoder remains available as a
+separate baseline.
+
+The gripper value is recovered from the blue-channel pedestal. To match the encoder's boundary
+convention, define
+$\Omega_n=\{(v,\vx):A^{(v)}_{B,n,\vx}\leq1/4\}$. The implementation uses
+\begin{equation}
+    \hat g_n
+    =4\,\frac{1}{|\Omega_n|}
+      \sum_{(v,\vx)\in\Omega_n}A^{(v)}_{B,n,\vx},
+    \label{eq:prelim-openness-decoder}
+\end{equation}
+with a median fallback if $\Omega_n$ is empty. Finally,
+\begin{equation}
+    \hat\ve_x=\operatorname{norm}(\hat\vq^{(G)}_n-\hat\vq^{(R)}_n),\qquad
+    \hat\ve_z=\operatorname{norm}(\hat\vq^{(R)}_n-\hat\vq^{(B)}_n),\qquad
+    \hat\ve_y=\operatorname{norm}(\hat\ve_z\times\hat\ve_x),
+    \label{eq:prelim-rotation-decoder}
+\end{equation}
+and $\hat\ve_z\leftarrow\hat\ve_x\times\hat\ve_y$ re-orthogonalizes the frame before forming
+$\hat\mR_n=[\hat\ve_x\mid\hat\ve_y\mid\hat\ve_z]$.
+
+\subsection{Packed sequences and masked flow matching}
+\label{sec:prelim-objective}
+
+Let $\Pi=(m_0,\ldots,m_{M-1})$ be the prompt-selected modality template in canonical order. The
+latent sequence is packed view-major and modality-minor:
+\begin{equation}
+    \tZ
+    =\big[\,\tZ^{(m_0,0)}\mid\cdots\mid\tZ^{(m_{M-1},0)}
+      \mid\tZ^{(m_0,1)}\mid\cdots\mid\tZ^{(m_{M-1},1)}\,\big].
+    \label{eq:prelim-packing}
+\end{equation}
+For the Action Images template this reduces to
+$[\,V_0\mid A_0\mid V_1\mid A_1\,]$. Let $L$ be the packed latent-time length and
+$\tZ_i=\tZ_{:,i,:,:}\in\R^{C_l\times H_l\times W_l}$. A sampled conditioning plan partitions
+the latent-time positions into clean conditions $\sG\subseteq\{1,\ldots,L\}$ and prediction
+targets $\sP=\{1,\ldots,L\}\setminus\sG$. A non-fully-given segment contributes its first latent
+frame to $\sG$; a fully-given segment contributes all of its latent frames.
+
+We use the optimal-transport linear path of flow matching \citep{lipman2023flow}. The training
+schedule contains $K=1000$ discrete base noise levels
+\begin{equation}
+    \hat\sigma_k=1-\frac{k}{K},
+    \qquad
+    \sigma_k=\frac{s\hat\sigma_k}{1+(s-1)\hat\sigma_k},
+    \qquad
+    k\sim\operatorname{Unif}\{0,\ldots,K-1\},\quad s=5.
+    \label{eq:prelim-shifted-schedule}
+\end{equation}
+Consequently, the grid runs from $\sigma_0=1$ to
+$\sigma_{K-1}=0.005/1.004\approx0.00498$; it does not include zero. The scalar presented to the
+Wan timestep embedding is $\tau_k=K\sigma_k$. For Gaussian noise
+$\eps\sim\gN(\vzero,\mI)$ with the same shape as $\tZ$, we construct
+\begin{equation}
+    \tilde\tZ_k=(1-\sigma_k)\tZ+\sigma_k\eps,
+    \qquad
+    [\tilde\tZ_k]_i=\tZ_i\quad\text{for }i\in\sG,
+    \qquad
+    \tU=\eps-\tZ.
+    \label{eq:prelim-noise}
+\end{equation}
+Thus predicted positions follow the linear data-to-noise path while conditions are restored to
+their clean values.
+
+The implementation additionally applies a scalar schedule weight. Define
+\begin{equation}
+    \bar w_k=\exp\!\left[-2\left(\frac{\tau_k-K/2}{K}\right)^2\right],
+    \qquad
+    w_k=K\,
+    \frac{\bar w_k-\min_j\bar w_j}
+         {\sum_{j=0}^{K-1}(\bar w_j-\min_r\bar w_r)}.
+    \label{eq:prelim-timestep-weight}
+\end{equation}
+This gives mean weight one over the discrete schedule and places the largest weight near
+$\sigma_k=1/2$. With prompt embedding $\vc$ and packed camera tensor $\tC$, the training loss is
+\begin{equation}
+    \gL(\vtheta)
+    =\E_{\tZ,\sG,k,\eps}\!\left[
+      \frac{w_k}{|\sP|C_lH_lW_l}
+      \sum_{i\in\sP}
+      \left\|
+        \left[f_{\vtheta}(\tilde\tZ_k,\tau_k,\tC,\vc)\right]_i
+        -\tU_i
+      \right\|_2^2
+    \right].
+    \label{eq:prelim-loss}
+\end{equation}
+Condition positions receive no direct reconstruction loss, but their activations can receive
+gradient through their influence on predicted positions. All modalities use the same output
+projection, timestep distribution, and loss: there is no modality-specific prediction head or
+loss coefficient. Task identity enters through the prompt and the contents and mask of the packed
+sequence, not through a change to $f_{\vtheta}$.

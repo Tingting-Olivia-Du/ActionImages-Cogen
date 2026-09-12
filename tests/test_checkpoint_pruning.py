@@ -171,6 +171,28 @@ def test_pruning_keeps_the_right_files():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_single_checkpoint_is_never_pruned():
+    """With only one checkpoint, nothing is pruned -- it IS the tip.
+
+    Cheap to state, expensive to get wrong: if the sole checkpoint were trimmed, the very
+    first save of a run would leave it unresumable, and the run could not restart from its
+    own only checkpoint. Verified live on 2026-08-10 too -- the real run logged no `pruned`
+    line at all after checkpoint-2, only after checkpoint-4 existed.
+    """
+    from train import ActionImagesTrainer
+
+    root = tempfile.mkdtemp()
+    try:
+        d = _fake_ckpt(root, 250)
+        before = sorted(os.listdir(d))
+        ActionImagesTrainer._prune_resume_state(object(), root, keep=d)
+        after = sorted(os.listdir(d))
+        assert before == after, f"the only checkpoint was modified: {before} -> {after}"
+        print(f"SINGLE_CHECKPOINT_UNTOUCHED_OK  {after}")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_pruning_is_idempotent_and_survives_partial_trees():
     """Re-running must not fail, and a half-written checkpoint must not abort the run."""
     from train import ActionImagesTrainer
@@ -193,6 +215,7 @@ def main():
     test_barrier_symmetry()
     test_negative_control_buggy_order()
     test_pruning_keeps_the_right_files()
+    test_single_checkpoint_is_never_pruned()
     test_pruning_is_idempotent_and_survives_partial_trees()
     print("ALL_CHECKPOINT_PRUNING_TESTS_PASSED")
 

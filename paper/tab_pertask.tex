@@ -1,0 +1,40 @@
+\begin{table}[t]
+\caption{Closed-loop control, per task. Every trained task with more than one variation is
+included; the three-task default of the evaluation harness happens to contain both tasks the
+model can do, so an aggregate over it is not representative.
+\textbf{GT-replay} runs each demonstration's own actions through the identical
+end-effector-pose controller and is the ceiling this harness imposes, not a model result.
+$^{\dagger}$ marks a task whose ground-truth replay also fails: the controller cannot express
+it, so its zero is excluded from the aggregate rather than charged to the model.
+$n{=}10$ trials per cell. Individual cells carry run-to-run noise: re-running an
+identical configuration flips $7\%$ of rollouts, because the sampling-based motion planner
+is not seeded by us. A cell is therefore $\pm 0.8$ successes, so $2/10$ against $1/10$ is
+not a difference; the aggregate is $\pm 2.5$ points.}
+\label{tab:pertask}
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+& \multicolumn{2}{c}{GT-replay ceiling} & \multicolumn{2}{c}{Unified model} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+Task & var.\ 0 & var.\ 1 & var.\ 0 & var.\ 1 \\
+\midrule
+\texttt{close\_jar}$^{\dagger}$ & 0/10 & 0/10 & \textbf{0/10} & \textbf{0/10} \\
+\texttt{insert\_onto\_square\_peg} & 10/10 & 9/10 & \textbf{2/10} & \textbf{0/10} \\
+\texttt{light\_bulb\_in} & 10/10 & 9/10 & \textbf{0/10} & \textbf{0/10} \\
+\texttt{meat\_off\_grill} & 10/10 & 9/10 & \textbf{5/10} & \textbf{1/10} \\
+\texttt{open\_drawer} & 10/10 & 9/10 & \textbf{0/10} & \textbf{0/10} \\
+\texttt{place\_shape\_in\_shape\_sorter} & 10/10 & 9/10 & \textbf{0/10} & \textbf{0/10} \\
+\texttt{push\_buttons} & 10/10 & 9/10 & \textbf{6/10} & \textbf{0/10} \\
+\texttt{put\_groceries\_in\_cupboard} & 8/10 & 10/10 & \textbf{1/10} & \textbf{0/10} \\
+\texttt{put\_item\_in\_drawer} & 10/10 & 9/10 & \textbf{0/10} & \textbf{0/10} \\
+\texttt{put\_money\_in\_safe} & 10/10 & 9/10 & \textbf{0/10} & \textbf{0/10} \\
+\texttt{reach\_and\_drag} & 10/10 & 10/10 & \textbf{0/10} & \textbf{0/10} \\
+\texttt{stack\_blocks} & 10/10 & 10/10 & \textbf{0/10} & \textbf{0/10} \\
+\texttt{turn\_tap} & 9/9 & 9/10 & \textbf{4/10} & \textbf{4/10} \\
+\midrule
+\textbf{Aggregate} (excl.\ $\dagger$) & --- & --- & \textbf{18/120} & \textbf{5/120} \\
+\quad success rate & --- & --- & 15.0\% [9.7, 22.5] & 4.2\% [1.8, 9.4] \\
+\bottomrule
+\end{tabular}
+\end{table}

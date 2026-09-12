@@ -288,3 +288,69 @@ GPUS=4,7 bash scripts/train_arm.sh arm2    # co-supervision（视 arm0/1 结果�
 - **bridge / droid / 混合数据**：只用 `rlbench_selfgen@1.0`。两者没有 depth/mask GT，
   模板系统会把它们当作 `video+action`（无 `template` 字段 → forward 回退默认）。
 - **cache 路径**：仍无 `cached_dataset.py` / `--use_cache`。感知 target 本来就不缓存（D-042）。
+
+---
+
+## 附:A 轴与 arm7(2026-09-04)
+
+### A 轴 —— `--action_mask_mix`
+
+`--perception_mask_mix`(M 轴)只管**不含** `<action>` 的模板。含 action 的模板一直用
+`train.py` 上游那三个硬编码常量,没有开关。arm7 的菜单四个模板全含 action,于是 M 轴一个字节
+都不起作用 —— 这条轴就是它的补集。
+
+| 预设 | (iiii, fiii, fifi, policy) | 用途 |
+|---|---|---|
+| `A0` | `(0.81, 0.045, 0.045, 0.10)` | **默认**,从上游常量推导,arm0–arm6 与 `step125750` 都是它 |
+| `A1` | `(0.75, 0.00, 0.05, 0.20)` | arm7 |
+| `A2` | `(0.90, 0.05, 0.05, 0.00)` | 90/5/5,无 policy 分支 |
+
+`plan_segments` 把这个边际**反推回上游那两次抽样的阈值**,而不是改成一次四路累计抽样。这是
+刻意的:上游就是两次抽样,且第一次(collapse)对所有数据集都会消耗(短路顺序)。改成一次会保住
+边际分布却改变同一个种子落到哪个分支 —— 正是 `test_forward_unchanged.py` 存在的意义。默认 A0
+下,推导出的三个阈值与 `SINGLE_FRAME_VISUAL_PROB` / `MODE_FIRST_SEGMENT_GIVEN_PROB` /
+`MODE_ALL_VISUAL_GIVEN_PROB` **浮点逐位相等**,所以这条轴在默认路径上是彻底的 no-op。
+
+改动文件:`training/templates.py`(常量 + `parse_action_mask_mix` + `plan_segments` 参数)、
+`training/args.py`、`train.py`(5 处,与 `perception_mask_mix` 一一对应)。
+wandb config 现在同时记录 `action_mask_mix` 与 `action_mask_mix_resolved` ——
+`None` 在 config 里读起来像「没有 mask 策略」,而它其实是 A0。
+
+### arm7
+
+```
+--template_mix video+action@0.4,depth+action@0.2,segmentation+action@0.2,normal+action@0.2
+--action_mask_mix A1  --segmentation_mode scene_roles
+```
+
+arm6 有 60% 的样本是 `video+X` 感知模板,**一个 action 段都没有**;算上 action dropout,只有
+`0.4 × 0.9 = 36%` 的步产生 action 梯度。arm7 让**每个**模板都带 action(90%),而且成本完全不变
+—— 四个模板都还是四段同形状。
+
+**对照组是 arm0 不是 arm6。** `outputs/specialist_action__seed42_fi3_512_aug_sr`
+(`video+action@1.0`,同样的 warm start / seed / 树 / interval / lr)有**同样的** 90% action
+样本率但只有一个模态。注意 arm7 同时改了菜单和 mask 轴(A1 vs A0),所以 arm7 − arm0 的差异不能
+单独归因于其中一个;要归因就得再跑一个 `ACTION_MASK_MIX=A1` 的 action specialist。
+
+**arm7 放弃了什么**:菜单里没有任何 `video+X`,所以这个 checkpoint **不能**被问 RGB→depth/seg/
+normal。`eval/eval_perception.py` 和 `eval/eval_all_masks.py` 对它是离分布的。它独有的新读数是
+「从哪个模态解动作」,用 `eval/eval_action.py --template <X>+action`。
+
+### 其他
+
+- `eval/eval_action.py` 新增 `--template`(四选一)与 `--segmentation_mode`。段切片
+  `q = len(arr)//4`、action 段在 index 1 和 3 对四个模板都成立(段序 view-major、action 在
+  视角内最后),但加了 `len(parse_template(...)) == 2` 的守卫,免得六段模板静默切错像素。
+  报告文件名和 video 文件名都带上 template,否则四次读数会互相覆盖。
+- `scripts/validate_mix.py::mask_mode` 修了一个会静默误报的 bug:`anchor` 原本硬编码成
+  `"video"`,对顶替模板过滤后是空集合,`all([])` 为 True,于是**每个** plan 都被读成 `fifi`。
+  现在从 plan 里取第一个视觉段。
+- `scripts/train_arm.sh` 起训时打印哪条 mask 轴是 INERT。这里**不能**用 `grep -qv`:本机
+  `/usr/bin/grep` 是 ugrep 7.5.0,它的 `-q -v` 即使存在不匹配行也返回 1,会把 arm6 的混合菜单
+  误报成「所有模板都含 action」。改用纯 bash 计数。
+  (同样的坑还在 `scripts/supervise_8h.sh:25`,本次未动。)
+- `scripts/smoke_arm.sh` 的默认数据树从 `rlbench_selfgen@1.0` 改为 `rlbench_selfgen_512_aug`,
+  分辨率按树推导(与 train_arm.sh 同一段逻辑)。原默认指向的 256 v2 树早已被删,
+  `data/rlbench_selfgen` 是**悬空软链** —— 也就是说这个脚本此前根本跑不起来。
+  同时新增 `SEG_MODE` / `FRAME_INTERVAL` / `PERCEPTION_MASK_MIX` / `ACTION_MASK_MIX` 环境变量并
+  透传,否则 smoke 验的是一个和真实臂不同的配置。

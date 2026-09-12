@@ -1,0 +1,56 @@
+\begin{table}[h]
+\caption{Every counterpart run, on every tier. The main table reports the best per row; this is the pool it was chosen from. \textbf{Free} is the number of parameters fitted against the ground truth per frame before scoring: metric models are scored as they claim, with none. Alignment is decided from the sign of each model's correlation with ground-truth depth rather than assumed, and all three alignments are listed so the choice is auditable. All models are trained on real photographs while these frames are synthetic renders.}
+\label{app:external}
+\centering\small
+\begin{tabular}{llcrrrr}
+\toprule
+Model & Split & Free & Reported & raw & med.-scale & disp.-affine \\
+\midrule
+\multicolumn{7}{l}{\emph{Depth} (AbsRel $\downarrow$)} \\
+Depth Anything V2-L \citep{yang2024depthanythingv2} & seen & 2 & \textbf{0.1331} & 6.0451 & 1.6306 & 0.1241 \\
+Depth Anything 3-L \citep{lin2025depthanything3} & seen & 1 & \textbf{0.1995} & 0.4106 & 0.1995 & 0.1356 \\
+VGGT-1B \citep{wang2025vggt} & seen & 1 & \textbf{0.2401} & 0.3983 & --- & --- \\
+Depth Anything V2-L \citep{yang2024depthanythingv2} & unseen task & 2 & \textbf{0.1194} & 6.5587 & 1.6485 & 0.1194 \\
+Lotus-G depth v2-0 \citep{he2025lotus} & unseen task & 2 & \textbf{0.1575} & 0.7162 & 1.5871 & 0.1575 \\
+Depth Anything 3-L \citep{lin2025depthanything3} & unseen task & 1 & \textbf{0.2011} & 0.3822 & 0.2011 & 0.1511 \\
+VGGT-1B \citep{wang2025vggt} & unseen task & 1 & \textbf{0.2057} & 0.3658 & --- & --- \\
+Depth Anything V2-L (metric) \citep{yang2024depthanythingv2} & unseen task & 0 & \textbf{0.2693} & 0.2693 & 0.1668 & 0.1701 \\
+Depth Pro \citep{bochkovskii2024depthpro} & unseen task & 0 & \textbf{0.3632} & 0.3632 & 0.1676 & 0.1850 \\
+Marigold depth v1-1 \citep{ke2024marigold} & unseen task & 1 & \textbf{0.4537} & 0.7405 & 0.4537 & 0.1880 \\
+Depth Anything V2-L \citep{yang2024depthanythingv2} & unseen var. & 2 & \textbf{0.1254} & 6.2181 & 1.6903 & 0.1254 \\
+Lotus-G depth v2-0 \citep{he2025lotus} & unseen var. & 2 & \textbf{0.1643} & 0.7252 & 1.7378 & 0.1643 \\
+Depth Anything 3-L \citep{lin2025depthanything3} & unseen var. & 1 & \textbf{0.2015} & 0.4102 & 0.2015 & 0.1490 \\
+VGGT-1B \citep{wang2025vggt} & unseen var. & 1 & \textbf{0.2318} & 0.3880 & --- & --- \\
+Depth Anything V2-L (metric) \citep{yang2024depthanythingv2} & unseen var. & 0 & \textbf{0.2725} & 0.2725 & 0.1751 & 0.1735 \\
+Depth Pro \citep{bochkovskii2024depthpro} & unseen var. & 0 & \textbf{0.3256} & 0.3256 & 0.1811 & 0.1870 \\
+Marigold depth v1-1 \citep{ke2024marigold} & unseen var. & 1 & \textbf{0.3884} & 0.7228 & 0.3884 & 0.2036 \\
+\midrule
+\multicolumn{7}{l}{\emph{Surface normal} (mean cosine $\uparrow$)} \\
+Lotus-G normal v1-1 \citep{he2025lotus} & unseen task & --- & \textbf{0.9435} & \multicolumn{3}{l}{convention: identity} \\
+normals from Depth Anything V2 \citep{yang2024depthanythingv2} & unseen task & --- & \textbf{0.9158} & \multicolumn{3}{l}{convention: ---} \\
+Marigold-Normals v1-1 \citep{ke2024marigold} & unseen task & --- & \textbf{0.8034} & \multicolumn{3}{l}{convention: identity} \\
+Lotus-G normal v1-1 \citep{he2025lotus} & unseen var. & --- & \textbf{0.9459} & \multicolumn{3}{l}{convention: identity} \\
+normals from Depth Anything V2 \citep{yang2024depthanythingv2} & unseen var. & --- & \textbf{0.9146} & \multicolumn{3}{l}{convention: ---} \\
+Marigold-Normals v1-1 \citep{ke2024marigold} & unseen var. & --- & \textbf{0.7885} & \multicolumn{3}{l}{convention: identity} \\
+\midrule
+\multicolumn{7}{l}{\emph{Segmentation} (bo-IoU / mIoU $\uparrow$)} \\
+SAM ViT-H \citep{kirillov2023sam} & seen & --- & \textbf{0.6634} & \multicolumn{3}{l}{58 masks/frame} \\
+U-CoGen (FIFI) & unseen task & --- & \textbf{0.8454} & \multicolumn{3}{l}{4 masks/frame} \\
+SAM ViT-H \citep{kirillov2023sam} & unseen task & --- & \textbf{0.6698} & \multicolumn{3}{l}{50 masks/frame} \\
+U-CoGen (IIII) & unseen task & --- & \textbf{0.6281} & \multicolumn{3}{l}{4 masks/frame} \\
+CLIPSeg \citep{luddecke2022clipseg} & unseen task & --- & \textbf{0.3414} & \multicolumn{3}{l}{} \\
+U-CoGen (FIFI) & unseen var. & --- & \textbf{0.8379} & \multicolumn{3}{l}{4 masks/frame} \\
+SAM ViT-H \citep{kirillov2023sam} & unseen var. & --- & \textbf{0.6318} & \multicolumn{3}{l}{63 masks/frame} \\
+U-CoGen (IIII) & unseen var. & --- & \textbf{0.5976} & \multicolumn{3}{l}{4 masks/frame} \\
+CLIPSeg \citep{luddecke2022clipseg} & unseen var. & --- & \textbf{0.2844} & \multicolumn{3}{l}{} \\
+\midrule
+\multicolumn{7}{l}{\emph{Future RGB} --- LPIPS $\downarrow$ / PSNR (dB) $\uparrow$ / SSIM $\uparrow$} \\
+ActionImages (released) & held-out & --- & \textbf{0.2308} & 15.24 & 0.7100 & $n{=}40$ \\
+Action specialist & held-out & --- & \textbf{0.2225} & 15.55 & 0.7145 & $n{=}40$ \\
+U-CoGen (IIII) & held-out & --- & \textbf{0.2280} & 15.29 & 0.7113 & $n{=}40$ \\
+ActionImages (released) & unseen task & --- & \textbf{0.2161} & 16.63 & 0.7277 & $n{=}66$ \\
+Action specialist & unseen task & --- & \textbf{0.2087} & 16.67 & 0.7289 & $n{=}66$ \\
+U-CoGen (IIII) & unseen task & --- & \textbf{0.2091} & 16.54 & 0.7325 & $n{=}72$ \\
+\bottomrule
+\end{tabular}
+\end{table}

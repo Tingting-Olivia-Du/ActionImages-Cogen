@@ -26,6 +26,16 @@ from training.utils import (
     project_action_5d_to_rgb_torch,
     get_plucker_embeddings_torch,
 )
+from training.templates import (
+    ACTION,
+    FUSION_REGIMES,
+    VISUAL_MODALITIES,
+    Segment,
+    assemble,
+    inference_plan,
+    parse_template,
+    segment_spans,
+)
 
 
 def _encode_video_bv(pipe, video_bvcthw: torch.Tensor, tiler_kwargs: dict) -> torch.Tensor:
@@ -325,7 +335,20 @@ class WanVideoActionImagesPipeline(BasePipeline):
         return outputs
 
     def decode_video(self, latents, tiled=True, tile_size=(34, 34), tile_stride=(18, 16)):
-        frames = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        # Wan2.2_VAE38's standalone decoder trims a one-latent temporal input to length zero.
+        # Policy-mode visual segments really are one latent long.  Causally pad only for decode
+        # and retain the first output frame; this does not alter the DiT canvas or its masks.
+        single_latent = latents.shape[2] == 1
+        decode_latents = torch.cat([latents, latents], dim=2) if single_latent else latents
+        frames = self.vae.decode(
+            decode_latents,
+            device=self.device,
+            tiled=tiled,
+            tile_size=tile_size,
+            tile_stride=tile_stride,
+        )
+        if single_latent:
+            frames = frames[:, :, :1]
         return frames
 
     def decode_videos_distributed(
@@ -528,6 +551,131 @@ class WanVideoActionImagesPipeline(BasePipeline):
         latents_input[~masks] = noise[~masks]
         return noise, latents_input, masks, cam_emb, seg_num, seg_latent_spans
 
+    def prepare_template_inference_latents(
+        self,
+        streams: dict,
+        camera: torch.Tensor,
+        action_7d: torch.Tensor,
+        extrinsics: torch.Tensor,
+        intrinsics: torch.Tensor,
+        template: str,
+        fully_given_modalities,
+        conditioning_mode: Optional[str],
+        tiler_kwargs: dict,
+        seed,
+        absent_modalities=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, List[Tuple[int, int]]]:
+        """Build a deterministic inference canvas using the training template layout.
+
+        This path handles deterministic evaluation of visual/perception and action templates.
+        Every visual stream contains both views concatenated along time,
+        exactly as emitted by ``RLBenchSelfgenDataset``.  The caller explicitly chooses the
+        fully-given modalities (for perception: RGB/video); every predicted segment keeps only
+        its first latent frame as condition, matching training's mask convention.
+
+        The existing ActionImages inference path is intentionally left separate so official
+        ``i2va/v2a/a2v`` behaviour remains byte-for-byte unchanged.
+        """
+        modalities = parse_template(template)
+        missing = [m for m in modalities if m in VISUAL_MODALITIES and m not in streams]
+        if missing:
+            raise KeyError(f"template {template!r} needs streams {missing}, got {sorted(streams)}")
+        if action_7d is None:
+            raise ValueError("action_7d is required as the per-view temporal length reference")
+
+        first = streams[modalities[0]]
+        B, C_px, N, H, W = first.shape
+        T = int(action_7d.shape[1])
+        if T <= 0 or N % T:
+            raise ValueError(f"stream time length N={N} is not divisible by action length T={T}")
+        num_views = N // T
+        for modality in (m for m in modalities if m in VISUAL_MODALITIES):
+            pixels = streams[modality]
+            if tuple(pixels.shape) != (B, C_px, N, H, W):
+                raise ValueError(
+                    f"stream {modality!r} has shape {tuple(pixels.shape)}, expected "
+                    f"{(B, C_px, N, H, W)}"
+                )
+
+        latents_by_modality = {}
+        for modality in (m for m in modalities if m in VISUAL_MODALITIES):
+            pixels = streams[modality].to(device=self.device, dtype=self.torch_dtype)
+            pixels_bvcthw = pixels.reshape(B, C_px, num_views, T, H, W).permute(0, 2, 1, 3, 4, 5)
+            lat_bv = _encode_video_bv(self, pixels_bvcthw.contiguous(), tiler_kwargs)
+            latents_by_modality[modality] = [lat_bv[:, v] for v in range(num_views)]
+
+        if ACTION in modalities:
+            if extrinsics is None:
+                raise ValueError("action template inference requires extrinsics")
+            action_rep = action_7d.repeat(1, num_views, 1)
+            action_5d = project_actions_7d_to_5d_torch_batch(action_rep, extrinsics, intrinsics)
+            action_pixels = project_action_5d_to_rgb_torch(action_5d, H, W)
+            action_pixels = action_pixels.permute(0, 4, 1, 2, 3).contiguous() * 2 - 1
+            action_bv = action_pixels.reshape(B, 3, num_views, T, H, W).permute(0, 2, 1, 3, 4, 5)
+            action_lat_bv = _encode_video_bv(self, action_bv.contiguous(), tiler_kwargs)
+            latents_by_modality[ACTION] = [action_lat_bv[:, v] for v in range(num_views)]
+
+        # Camera encoding is the same per-view Pluecker construction used by training forward().
+        extrinsics_3x4 = camera.reshape(B, -1, 3, 4)
+        plucker = get_plucker_embeddings_torch(extrinsics_3x4, intrinsics, (H, W))
+        plucker = plucker.permute(0, 4, 1, 2, 3).contiguous()
+        direction, moment = plucker[:, :3], plucker[:, 3:] / 3.0
+        direction_bv = direction.reshape(B, 3, num_views, T, H, W).permute(0, 2, 1, 3, 4, 5)
+        moment_bv = moment.reshape(B, 3, num_views, T, H, W).permute(0, 2, 1, 3, 4, 5)
+        dir_lat_bv = _encode_video_bv(self, direction_bv.contiguous(), tiler_kwargs)
+        mom_lat_bv = _encode_video_bv(self, moment_bv.contiguous(), tiler_kwargs)
+        camera_latents = [
+            torch.cat([dir_lat_bv[:, v], mom_lat_bv[:, v]], dim=1).permute(0, 2, 1, 3, 4)
+            for v in range(num_views)
+        ]
+
+        fully_given = set(fully_given_modalities or ())
+        unknown_given = fully_given - set(modalities)
+        if unknown_given:
+            raise ValueError(f"fully-given modalities {sorted(unknown_given)} are not in {template!r}")
+        absent = set(absent_modalities or ())
+        unknown_absent = absent - set(modalities)
+        if unknown_absent:
+            raise ValueError(f"absent modalities {sorted(unknown_absent)} are not in {template!r}")
+        overlap = absent & fully_given
+        if overlap:
+            raise ValueError(
+                f"modalities {sorted(overlap)} are both fully-given and absent; the two roles "
+                f"are mutually exclusive"
+            )
+        anchor = next(m for m in modalities if m in VISUAL_MODALITIES)
+        # Role assignment lives in templates.inference_plan, NOT here. It used to be an inline
+        # table, and scripts/modality_mode_grid.py carried a second hand-written copy of it to
+        # slice the decoded frames -- two transcriptions of one table, which is how a scorer ends
+        # up reporting depth's metric under segmentation's name. One function, called by both.
+        if conditioning_mode is not None and (fully_given or absent):
+            raise ValueError(
+                "pass either conditioning_mode or fully_given_modalities/absent_modalities, not both"
+            )
+        plan = inference_plan(
+            modalities, num_views,
+            mode=conditioning_mode,
+            fully_given=None if conditioning_mode is not None else fully_given,
+            absent=None if conditioning_mode is not None else absent,
+        )
+        latents_input, cam_emb, masks = assemble(plan, latents_by_modality, camera_latents)
+
+        # NOTE f0f0 used to clear the target spans HERE, after assemble had already handed
+        # every non-full segment its first latent. That post-hoc correction is gone: the same
+        # spans are now declared `absent` in the plan above, so assemble never sets them and the
+        # resulting mask is bit-identical (tests/test_eval_assembly.py pins this).
+        spans = segment_spans(plan, latents_by_modality)
+        offset = spans[-1][1] if spans else 0
+        if offset != latents_input.shape[2]:
+            raise RuntimeError(f"segment spans end at {offset}, latent canvas has {latents_input.shape[2]} frames")
+        noise = self.generate_noise(tuple(latents_input.shape), seed=seed, device=self.device)
+        latents_input = latents_input.to(device=self.device, dtype=self.torch_dtype)
+        noise = noise.to(device=self.device, dtype=self.torch_dtype)
+        cam_emb = cam_emb.to(device=self.device, dtype=self.torch_dtype)
+        masks = masks.to(device=self.device)
+        latents_input[~masks] = noise[~masks]
+        return noise, latents_input, masks, cam_emb, len(plan), spans
+
     @torch.no_grad()
     def __call__(
         self,
@@ -541,6 +689,11 @@ class WanVideoActionImagesPipeline(BasePipeline):
         extrinsics: Optional[torch.Tensor] = None,
         intrinsics: Optional[torch.Tensor] = None,
         task_type: Optional[str] = "i2va",
+        template: Optional[str] = None,
+        streams: Optional[dict] = None,
+        fully_given_modalities: Optional[List[str]] = None,
+        conditioning_mode: Optional[str] = None,
+        absent_modalities: Optional[List[str]] = None,
         # Legacy/optional inputs
         input_image=None,
         input_video=None,
@@ -574,27 +727,43 @@ class WanVideoActionImagesPipeline(BasePipeline):
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
 
         # Follow training forward(): build ActionImages latents and camera embeddings
-        assert (
-            video is not None
-            and camera is not None
-            and extrinsics is not None
-            and intrinsics is not None
-            and (action_7d is not None or action_5d is not None)
-        ), "video, camera, extrinsics, intrinsics and one of action_7d/action_5d are required"
+        assert camera is not None and intrinsics is not None, "camera and intrinsics are required"
 
         # Prepare action video from 7D actions
         self.load_models_to_device(["vae"])
-        noise, latents_input, masks, cam_emb, seg_num, seg_latent_spans = self.prepare_action_images_inference_latents(
-            video,
-            camera,
-            action_7d,
-            action_5d,
-            extrinsics,
-            intrinsics,
-            task_type,
-            tiler_kwargs,
-            seed,
-        )
+        if template is not None:
+            if streams is None:
+                raise ValueError("template inference requires streams")
+            noise, latents_input, masks, cam_emb, seg_num, seg_latent_spans = self.prepare_template_inference_latents(
+                streams,
+                camera,
+                action_7d,
+                extrinsics,
+                intrinsics,
+                template,
+                fully_given_modalities,
+                conditioning_mode,
+                tiler_kwargs,
+                seed,
+                absent_modalities=absent_modalities,
+            )
+        else:
+            assert (
+                video is not None
+                and extrinsics is not None
+                and (action_7d is not None or action_5d is not None)
+            ), "video, extrinsics and one of action_7d/action_5d are required"
+            noise, latents_input, masks, cam_emb, seg_num, seg_latent_spans = self.prepare_action_images_inference_latents(
+                video,
+                camera,
+                action_7d,
+                action_5d,
+                extrinsics,
+                intrinsics,
+                task_type,
+                tiler_kwargs,
+                seed,
+            )
 
         # Encode prompts
         self.load_models_to_device(["text_encoder"])

@@ -13,6 +13,14 @@ import random
 import traceback
 from einops import rearrange
 from training.utils import get_relative_pose_batch, CenterCropToAspect, convert_intrinsics_after_center_crop_resize
+from training.templates import (
+    ACTION,
+    assert_menu_supported,
+    draw_template,
+    format_template,
+    parse_template_mix,
+    prompt_prefix,
+)
 
 
 class BaseDataset(torch.utils.data.Dataset, ABC):
@@ -22,6 +30,15 @@ class BaseDataset(torch.utils.data.Dataset, ABC):
     This template provides a common interface and shared functionality
     for datasets used in multi-view video generation tasks.
     """
+
+    # FORK: which modalities this tree can actually put in a segment. The template menu is
+    # validated against it at construction, so asking bridge for `video+action` fails loudly
+    # at startup instead of silently degrading to `video` for the whole run.
+    AVAILABLE_MODALITIES: Tuple[str, ...] = ("video", ACTION)
+    # Whether BaseDataset.getitem applies the template itself. RLBenchSelfgenDataset sets this
+    # False because it overrides getitem to also build depth/segmentation streams, and applying
+    # the prompt prefix in both places would emit the tags twice.
+    TEMPLATE_IN_BASE: bool = True
 
     def __init__(
         self,
@@ -48,6 +65,17 @@ class BaseDataset(torch.utils.data.Dataset, ABC):
         self.frame_interval = frame_interval
         self.height = height
         self.width = width
+
+        # FORK: template machinery. Guarded by hasattr because RLBenchSelfgenDataset parses its
+        # own menu BEFORE delegating here -- overwriting it with the default would silently turn
+        # a depth arm into a plain video+action arm.
+        if not hasattr(self, "_templates"):
+            self._init_templates(
+                template_mix=kwargs.pop("template_mix", "video+action@1.0"),
+                prompt_tag_style=kwargs.pop("prompt_tag_style", "explicit"),
+                action_dropout_prob=kwargs.pop("action_dropout_prob", 0.1),
+                strict_getitem=kwargs.pop("strict_getitem", False),
+            )
 
         # Initialize frame processing pipeline
         self.frame_process = v2.Compose(
@@ -96,6 +124,39 @@ class BaseDataset(torch.utils.data.Dataset, ABC):
         pass
 
     # ======== END ========
+
+    # ======== FORK: task templates ========
+    def _init_templates(
+        self,
+        template_mix: str = "video+action@1.0",
+        prompt_tag_style: str = "explicit",
+        action_dropout_prob: float = 0.1,
+        strict_getitem: bool = False,
+    ) -> None:
+        assert_menu_supported(type(self).__name__, template_mix, self.AVAILABLE_MODALITIES)
+        self._templates, self._template_cum = parse_template_mix(template_mix)
+        self.prompt_tag_style = prompt_tag_style
+        self.action_dropout_prob = float(action_dropout_prob)
+        self.strict_getitem = bool(strict_getitem)
+
+    def _apply_template(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach `template` / `streams` / prompt tags to a plain visual sample.
+
+        This is the version for trees that own no perception GT, i.e. every modality they can
+        serve is either `video` (already in the sample) or `action` (rendered inside forward
+        from action_7d, so it never needs pixels here). RLBenchSelfgenDataset does the richer
+        variant that also loads depth/segmentation.
+        """
+        mods = draw_template(self._templates, self._template_cum)
+        # Upstream's action gate (train.py:286 `random.random() < 0.9`) lives in the dataset so
+        # the prompt and the segment layout are decided together.
+        if ACTION in mods and random.random() < self.action_dropout_prob:
+            mods = tuple(m for m in mods if m != ACTION)
+        sample["streams"] = {"video": sample["video"]}
+        sample["template"] = format_template(mods)
+        sample["visual_modality"] = "video"
+        sample["text"] = prompt_prefix(mods, None, self.prompt_tag_style) + sample["text"]
+        return sample
 
     def select_views(self, candidate_indices: List[int], view_indices: List[int]) -> List[int]:
         return [candidate_indices[i] for i in view_indices]
@@ -152,7 +213,7 @@ class BaseDataset(torch.utils.data.Dataset, ABC):
         actions_7d = torch.from_numpy(actions_7d)
         actions_8d = torch.from_numpy(actions_8d)
 
-        return {
+        sample = {
             "text": text,  # str
             "video": combined_video,  # 3, T * 2, H, W
             "camera": camera_poses,  # T * 2, 12
@@ -171,6 +232,9 @@ class BaseDataset(torch.utils.data.Dataset, ABC):
             "view_indices": list(view_indices),  # [cond, target], indexes into view_dirs
             "view_dirs": list(getattr(self, "_last_view_dirs", None) or []),
         }
+        if self.TEMPLATE_IN_BASE:
+            sample = self._apply_template(sample)
+        return sample
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         """Get item with retry logic for robustness.
@@ -276,6 +340,8 @@ class CombDataset(torch.utils.data.Dataset):
         action_dropout_prob: float = 0.1,
         strict_getitem: bool = False,
         variations: str = "all",
+        segmentation_mode: str = "referring",
+        template_mix_per_dataset: str = "",
     ) -> None:
         super().__init__()
 
@@ -283,6 +349,16 @@ class CombDataset(torch.utils.data.Dataset):
             dataset_specs = f"{dataset_specs}@1.0"
 
         dataset_specs = [s.strip() for s in dataset_specs.split(",") if s.strip()]
+
+        # FORK: the feasible template menu is a property of the data, not of the run, so each
+        # tree gets its own. Unlisted trees fall back to the global --template_mix.
+        from training.templates import parse_per_dataset_template_mix
+
+        _selected = [sp.split("@", 1)[0].strip().lower() for sp in dataset_specs if sp.strip()]
+        per_ds = parse_per_dataset_template_mix(template_mix_per_dataset, template_mix, known=_selected)
+
+        def mix_for(name: str) -> str:
+            return per_ds.get(name, template_mix)
 
         # Lazy import to avoid circular imports with BaseDataset subclasses
         from training.dataset.bridge import BridgeMVDataset
@@ -294,9 +370,21 @@ class CombDataset(torch.utils.data.Dataset):
             "bridge": lambda: BridgeMVDataset(
                 base_path=os.path.join(dataset_path, "bridge"),
                 num_frames=num_frames,
-                frame_interval=frame_interval,
+                # Pinned to 1, like droid is pinned to 4, because the stride that makes sense
+                # is a property of the SOURCE's frame rate, not of the run. Bridge is natively
+                # 5 Hz, so 41 frames already span 8.0 s -- the same window the official
+                # checkpoint was trained on. Raising it is not merely unnecessary, it is
+                # destructive: bridge episodes have a median of 32 frames, so frame_interval=3
+                # needs 121 and NO episode has them. load_video_frames then clamps, and a
+                # typical sample degenerates to 12 distinct frames followed by 29 copies of the
+                # last one -- i.e. "predict a video that freezes", on 10% of all steps.
+                frame_interval=1,
                 height=height,
                 width=width,
+                template_mix=mix_for("bridge"),
+                prompt_tag_style=prompt_tag_style,
+                action_dropout_prob=action_dropout_prob,
+                strict_getitem=strict_getitem,
             ),
             "rlbench": lambda: RLBenchMVDataset(
                 base_path=os.path.join(dataset_path, "rlbench"),
@@ -304,6 +392,10 @@ class CombDataset(torch.utils.data.Dataset):
                 frame_interval=frame_interval,
                 height=height,
                 width=width,
+                template_mix=mix_for("rlbench"),
+                prompt_tag_style=prompt_tag_style,
+                action_dropout_prob=action_dropout_prob,
+                strict_getitem=strict_getitem,
             ),
             "droid": lambda: DROIDMVDataset(
                 base_path=os.path.join(dataset_path, "droid"),
@@ -311,6 +403,10 @@ class CombDataset(torch.utils.data.Dataset):
                 frame_interval=4,
                 height=height,
                 width=width,
+                template_mix=mix_for("droid"),
+                prompt_tag_style=prompt_tag_style,
+                action_dropout_prob=action_dropout_prob,
+                strict_getitem=strict_getitem,
             ),
             # FORK: self-generated RLBench with per-frame depth/mask GT alongside RGB. The only
             # source that can serve a perception modality; `template_mix` decides which task
@@ -322,11 +418,98 @@ class CombDataset(torch.utils.data.Dataset):
                 frame_interval=frame_interval,
                 height=height,
                 width=width,
-                template_mix=template_mix,
+                template_mix=mix_for("rlbench_selfgen"),
                 prompt_tag_style=prompt_tag_style,
                 action_dropout_prob=action_dropout_prob,
                 strict_getitem=strict_getitem,
                 variations=variations,
+                segmentation_mode=segmentation_mode,
+            ),
+            # FORK: the same loader against the 512x512 tree (ttd/data/rlbench_selfgen_512),
+            # rendered natively at the official ActionImages resolution rather than the 256 of
+            # `rlbench_selfgen`. A SEPARATE NAME rather than a repointed `data/rlbench_selfgen`
+            # symlink, deliberately: _load_dataset globs episode paths that still contain the
+            # symlink component and only resolve at open() time, so flipping the symlink under a
+            # live 256 run silently swaps its data mid-training instead of failing. Two names let
+            # a 256 arm and a 512 arm run side by side.
+            # NOTE its episodes are NOT the 256 tree's episodes at higher resolution -- different
+            # seeds, different scene layouts -- so a 256 arm's r_peak is not a baseline for a 512
+            # arm. Re-run the control arm on this tree (see train_arm.sh, "WHY Arm-0 IS NOT
+            # OPTIONAL").
+            "rlbench_selfgen_512": lambda: RLBenchSelfgenDataset(
+                base_path=os.path.join(dataset_path, "rlbench_selfgen_512"),
+                num_frames=num_frames,
+                frame_interval=frame_interval,
+                height=height,
+                width=width,
+                template_mix=mix_for("rlbench_selfgen_512"),
+                prompt_tag_style=prompt_tag_style,
+                action_dropout_prob=action_dropout_prob,
+                strict_getitem=strict_getitem,
+                variations=variations,
+                segmentation_mode=segmentation_mode,
+            ),
+            # FORK: 512x512 WITH Colosseum-style domain randomisation -- camera pose (spherical
+            # orbit with a per-task look-at), table colour/texture, background texture and light
+            # colour. See ActionImages-Cogen/scripts/colosseum_aug.py for the measurement that
+            # fixed each range against the official ActionImages release, and for the three
+            # factors deliberately left out (object colour breaks "close the RED jar"-style
+            # instruction grounding; distractors need a spawn boundary stock RLBench lacks;
+            # physics is not randomised in the official release either).
+            #
+            # This is the only self-gen tree whose visual diversity is comparable to the official
+            # one. `rlbench_selfgen` (256) and `rlbench_selfgen_512` vary the back wall ONLY: the
+            # table, the lights and all four cameras are byte-identical across every episode.
+            # 1028 episodes, 788 of them variation0.
+            #
+            # NOTE `rlbench_selfgen_512` above is currently a DANGLING symlink -- that tree was
+            # deleted to free disk. Selecting it will fail at glob time. It is kept in the table
+            # because regenerating it is the only way to get an un-augmented 512 control arm.
+            "rlbench_selfgen_512_aug": lambda: RLBenchSelfgenDataset(
+                base_path=os.path.join(dataset_path, "rlbench_selfgen_512_aug"),
+                num_frames=num_frames,
+                frame_interval=frame_interval,
+                height=height,
+                width=width,
+                template_mix=mix_for("rlbench_selfgen_512_aug"),
+                prompt_tag_style=prompt_tag_style,
+                action_dropout_prob=action_dropout_prob,
+                strict_getitem=strict_getitem,
+                variations=variations,
+                segmentation_mode=segmentation_mode,
+            ),
+            # FORK: the SCALED-UP tree, same recipe as rlbench_selfgen_512_aug (same 16 tasks,
+            # same Colosseum randomisation, same 512) with 250 variation0 seeds per task instead
+            # of 50 -- ~4000 training episodes against 788.
+            #
+            # A SEPARATE NAME, not more episodes in the tree above, and that is not a disk
+            # decision. Training globs the whole tree under `--variations 0`, so appending here
+            # would silently change what arm0..arm7u were trained on and destroy every
+            # arm-to-arm comparison in the paper -- the same class of silent substitution the
+            # `_fi<N>` / `_sr` / tree suffixes in train_arm.sh's OUT path exist to prevent.
+            #
+            # It exists because 788 episodes is the binding constraint on the fusion arm: a
+            # 10-segment canvas (video+depth+segmentation+normal+action) extracts far more
+            # supervision per sample, but supervision per EPISODE is not episode diversity, and
+            # train_arm.sh already cites Argus (CVPR 2025) Tab.13 for four auxiliary streams
+            # being the ceiling at the old scale. Required before any from-Wan-base run.
+            #
+            # Task set is deliberately UNCHANGED: `scene_roles` resolves handles through
+            # per-task rules in training/percep/scene_segments_gen.py TASK_ROLES (22 tasks
+            # covered), and _check_scene_roles_ready raises on a single `unknown` pixel. Adding
+            # tasks means writing those rules first; adding seeds costs nothing.
+            "rlbench_selfgen_512_aug_wide": lambda: RLBenchSelfgenDataset(
+                base_path=os.path.join(dataset_path, "rlbench_selfgen_512_aug_wide"),
+                num_frames=num_frames,
+                frame_interval=frame_interval,
+                height=height,
+                width=width,
+                template_mix=mix_for("rlbench_selfgen_512_aug_wide"),
+                prompt_tag_style=prompt_tag_style,
+                action_dropout_prob=action_dropout_prob,
+                strict_getitem=strict_getitem,
+                variations=variations,
+                segmentation_mode=segmentation_mode,
             ),
         }
 
@@ -355,6 +538,18 @@ class CombDataset(torch.utils.data.Dataset):
 
         if not datasets:
             raise ValueError("No valid datasets constructed from specs.")
+
+        # A positive-weight dataset with zero episodes silently redirects its share to whichever
+        # other dataset __getitem__ finds first (see the `local_len == 0` fallback below), so the
+        # realised mix stops matching the requested one with nothing in the log saying so. A
+        # broken symlink or a half-finished preprocessing run is exactly how this happens.
+        empty = [n for n, d in zip(names, datasets) if len(d) == 0]
+        if empty:
+            raise ValueError(
+                f"dataset(s) {empty} were given a positive ratio but contain 0 episodes. "
+                f"Check the data/ symlinks and that preprocessing finished; refusing to "
+                f"silently redistribute their share to the other datasets."
+            )
 
         # Normalize ratios and build cumulative distribution for sampling
         ratio_sum = float(sum(ratios))

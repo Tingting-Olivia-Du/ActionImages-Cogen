@@ -782,7 +782,7 @@ def main():
 
     os.makedirs(OUT, exist_ok=True)
     report = {"index": args.index}
-    ds = RLBenchSelfgenDataset(base_path=os.path.join(REPO, "data", "rlbench_selfgen"),
+    ds = RLBenchSelfgenDataset(base_path=os.path.join(REPO, "data", "rlbench_selfgen_512_aug"),
                                num_frames=NUM_FRAMES, frame_interval=1, height=RES, width=RES,
                                template_mix="depth+action@1.0", strict_getitem=True)
 

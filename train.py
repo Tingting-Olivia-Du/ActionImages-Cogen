@@ -3,6 +3,7 @@ import os
 import torch
 import torch.nn as nn
 import random
+import warnings
 import wandb
 import re
 from transformers import Trainer
@@ -22,6 +23,12 @@ from training.templates import (
     VISUAL_MODALITIES,
     assemble,
     parse_template,
+    describe_plan,
+    fusion_regime_of,
+    segment_spans,
+    parse_action_mask_mix,
+    parse_fusion_mask_mix,
+    parse_perception_mask_mix,
     plan_segments,
 )
 
@@ -122,8 +129,21 @@ class ActionImagesModel(nn.Module):
         tile_size=(34, 34),
         tile_stride=(18, 16),
         full_param=False,
+        perception_mask_mix=None,
+        action_mask_mix=None,
+        fusion_mask_mix=None,
     ):
         super().__init__()
+        # The M and A axes (SEGMENTATION_SCENE_ROLES_PLAN.md §10.3, templates.py). They partition
+        # the template space: M applies to templates WITHOUT <action>, A to those with it. Parsed
+        # once here rather than per forward: an invalid mix must fail before the 12.8 GB
+        # checkpoint load, not 3 minutes in.
+        self.perception_mask_mix = parse_perception_mask_mix(perception_mask_mix)
+        self.action_mask_mix = parse_action_mask_mix(action_mask_mix)
+        # The F axis (templates.py FUSION_MASK_MIX_PRESETS). Stays None unless asked for, and
+        # None routes multi-modality templates back to M/A -- that is the `fusion0-anchor`
+        # control, not an omission.
+        self.fusion_mask_mix = parse_fusion_mask_mix(fusion_mask_mix)
 
         # Load all models
         logger.info(f"Loading models: {model_id}")
@@ -313,6 +333,10 @@ class ActionImagesModel(nn.Module):
                 self.pipe.encode_video(pixels[:, :, v * T : (v + 1) * T, ...], **self.tiler_kwargs)
                 for v in range(num_views)
             ]
+        # visual_latents = {
+        #     "video": [video_view0_latent, video_view1_latent],
+        #     "depth": [depth_view0_latent, depth_view1_latent],
+        # }
 
         # Prepare plucker embeddings
         extrinsics_3x4 = camera.reshape(B, -1, 3, 4)  # [B, 2T, 3, 4]
@@ -332,6 +356,27 @@ class ActionImagesModel(nn.Module):
         # through each view's own camera. A dataset with no usable actions (bridge) keeps the
         # upstream behaviour of collapsing to the visual-only sequence.
         if ACTION in modalities and torch.sum(action_7d**2) == 0:
+            # UPSTREAM BEHAVIOUR, and a prompt/layout inconsistency wherever it fires. The text
+            # was built in the dataset from a Pi that still contained `action`, so dropping the
+            # segment here leaves the prompt promising `<action>` for a sequence that has none.
+            #
+            # It never fires on rlbench_selfgen (measured: 0 of 788 variation0 episodes have a
+            # zero action_7d, all quaternions unit-norm). It fires on EVERY bridge sample, whose
+            # actions are all zero for want of calibration -- so the multi-dataset path must give
+            # bridge an explicit `bridge=video@1.0` menu rather than relying on this fallback.
+            # That is MULTIDATASET_DEPTH_PLAN.md's G5, and this is where it would bite.
+            #
+            # Refusing outright would break the documented bridge fallback, so this warns loudly
+            # and once per process instead: a silent mismatch is what must not happen.
+            if "<action>" in "".join(text) and not getattr(self, "_warned_action_drop", False):
+                self._warned_action_drop = True
+                warnings.warn(
+                    f"action_7d is all zeros for {inputs['path'][0]}, so the <action> segment was "
+                    f"dropped -- but the prompt still says '<action>'. The text now promises a "
+                    f"stream the sequence does not contain. Give this dataset an explicit "
+                    f"action-free menu (e.g. `bridge=video@1.0` in --template_mix_per_dataset).",
+                    RuntimeWarning,
+                )
             modalities = tuple(m for m in modalities if m != ACTION)
         action_latents = None
         if ACTION in modalities:
@@ -353,6 +398,9 @@ class ActionImagesModel(nn.Module):
             modalities,
             num_views,
             is_rlbench="rlbench" in inputs["path"][0],
+            perception_mask_mix=self.perception_mask_mix,
+            action_mask_mix=self.action_mask_mix,
+            fusion_mask_mix=self.fusion_mask_mix,
         )
         latents, camera_emb, masks = assemble(plan, latents_by_modality, camera_latents)
 
@@ -385,7 +433,85 @@ class ActionImagesModel(nn.Module):
 
         loss = loss * self.pipe.scheduler.training_weight(timestep)
 
-        return {"loss": loss}
+        out = {"loss": loss}
+        out.update(self._segment_diagnostics(se, valid, plan, latents_by_modality))
+        return out
+
+    def _segment_diagnostics(self, se, valid, plan, latents_by_modality):
+        """Per-segment loss, attributed back to (modality, role) and to sequence position.
+
+        Reported as a RATIO to the step's own overall loss, never as an absolute. The absolute
+        scale of a step is set almost entirely by its `timestep` draw -- one uniform sample per
+        step, spanning three orders of magnitude -- so absolute per-segment numbers averaged
+        over a logging window measure the timestep lottery, not the segments. The ratio divides
+        that common factor out; `train/loss` already carries the scale.
+
+        Three readings, each answering a question the aggregate loss cannot:
+
+          segloss/<modality>/<role>  role is `anchored` (frame 0 given) or `absent` (nothing
+              given). `depth/absent` vs `depth/anchored` IS the cross-modal completion measure:
+              how much worse is depth when it has to come from the other modalities instead of
+              from its own first frame.
+          segloss_pos/<k>  loss of the k-th segment in packing order. The RoPE-extrapolation
+              probe: segments 8-9 sit at temporal positions 88-109, which neither Wan2.2-TI2V-5B
+              (pretrained to ~31 latent frames) nor the step125750 warm start (44) has ever
+              seen. A systematic rise with k is that extrapolation showing up.
+          regime/<name>  one-hot on the F-axis draw. Averaged over a logging window it is the
+              realised regime distribution, so a mistyped --fusion_mask_mix is visible in the
+              run itself rather than only in the config.
+
+        Costs a handful of reductions over a tensor that is already materialised.
+        """
+        with torch.no_grad():
+            # [B, T]: collapse channels and space, keep the latent-frame axis the spans index.
+            se_t = se.sum((1, 3, 4))
+            valid_t = valid.sum((1, 3, 4))
+            total_valid = valid_t.sum()
+            if total_valid <= 0:
+                return {}
+            overall = se_t.sum() / total_valid
+            if not bool(torch.isfinite(overall)) or float(overall) <= 0:
+                return {}
+
+            # Reduce on the GPU and cross to the host ONCE. A `.item()` per segment is a
+            # separate device sync, and on the 10-segment canvas that is 10 stalls per step
+            # bought for nothing -- the values are only ever written to a log.
+            kept, sums, counts = [], [], []
+            for idx, ((a, b), seg) in enumerate(zip(segment_spans(plan, latents_by_modality), plan)):
+                v = valid_t[:, a:b].sum()
+                if v <= 0:
+                    continue  # fully-given segment: no predicted position, nothing to report
+                kept.append((idx, seg))
+                sums.append(se_t[:, a:b].sum())
+                counts.append(v)
+            if not kept:
+                return {}
+            rels = ((torch.stack(sums) / torch.stack(counts)) / overall).tolist()
+
+            stats = {}
+            by_role = {}
+            for (idx, seg), rel in zip(kept, rels):
+                stats[f"segloss_pos/{idx}"] = rel
+                role = "absent" if seg.absent else "anchored"
+                by_role.setdefault((seg.modality, role), []).append(rel)
+            for (modality, role), vals in by_role.items():
+                # Mean over the two views: they are the same modality under the same role, and
+                # a per-view split would double the key count to say the same thing.
+                stats[f"segloss/{modality}/{role}"] = sum(vals) / len(vals)
+
+            if self.fusion_mask_mix is not None:
+                stats[f"regime/{fusion_regime_of(plan)}"] = 1.0
+
+            # The allocator's own high-water mark, not a poll. Sampling nvidia-smi every few
+            # seconds MISSES transient peaks: the 20-step fusion smoke sat at 39.7 GB in 149 of
+            # 150 samples and touched 44.2 GB in the remaining one, so a poll-based reading
+            # understated the peak by 4.5 GB and would have argued for a GPU count that OOMs.
+            # Reset each step so the number means "this step", not "since process start".
+            if torch.cuda.is_available():
+                stats["mem/peak_gb"] = torch.cuda.max_memory_allocated() / 2**30
+                stats["mem/reserved_gb"] = torch.cuda.max_memory_reserved() / 2**30
+                torch.cuda.reset_peak_memory_stats()
+            return stats
 
     @property
     def device(self):
@@ -451,10 +577,20 @@ class ActionImagesTrainer(Trainer):
         # Forward pass
         outputs = model(**inputs)
         loss = outputs["loss"]
+        # Everything except "loss" is a rank-local diagnostic scalar (per-segment loss ratios,
+        # the F-axis regime one-hot). Not all-reduced on purpose: the plan differs per rank, so
+        # a mean over ranks would average `depth/absent` against `depth/anchored` and destroy
+        # exactly the contrast the numbers exist to show. Rank 0's stream is a fair sample of
+        # the same distribution over thousands of steps.
+        diagnostics = {k: v for k, v in outputs.items() if k != "loss"}
 
         # gather loss from all processes
         loss_gather = torch.tensor(loss.item(), device=self.args.device)
-        torch.distributed.all_reduce(loss_gather, op=torch.distributed.ReduceOp.AVG)
+        # Guarded like the barrier above: plain `python train.py` never initialises a process
+        # group, and an unguarded all_reduce turns that into
+        # "ValueError: Default process group has not been initialized".
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(loss_gather, op=torch.distributed.ReduceOp.AVG)
 
         # Log additional metrics to wandb (only on rank 0)
         if self.is_world_process_zero() and wandb.run is not None:
@@ -462,6 +598,7 @@ class ActionImagesTrainer(Trainer):
                 {
                     "train/loss": loss_gather.item(),
                     "train/step": self.state.global_step,
+                    **diagnostics,
                 },
                 step=self.state.global_step,
             )
@@ -529,13 +666,12 @@ class ActionImagesTrainer(Trainer):
         # Get the actual model (handle DDP wrapper)
         actual_model = self._get_actual_model(model)
 
-        # Save only the trainable parameters
-        trainable_param_names = list(
-            filter(
-                lambda named_param: named_param[1].requires_grad, actual_model.pipe.denoising_model().named_parameters()
-            )
-        )
-        trainable_param_names = set([named_param[0] for named_param in trainable_param_names])
+        # Saves the FULL denoiser state_dict, not just the trainable subset. The comment here
+        # used to claim otherwise and the filtered `trainable_param_names` set it built was
+        # never applied -- harmless under --full_param True (every parameter is trainable), but
+        # it silently makes a partial-finetune checkpoint far larger than the docs imply.
+        # Filtering is left off deliberately: the resume path and the released
+        # step125750.ckpt both expect a complete denoiser state_dict.
         state_dict = actual_model.pipe.denoising_model().state_dict()
 
         # Save the model state dict
@@ -645,6 +781,52 @@ def _latest_resumable_checkpoint(output_dir):
     return best[1] if best else None
 
 
+
+def _step_of(path):
+    """step number encoded in a `.../checkpoint-N` dir or a `.../stepN.ckpt` file, else None."""
+    if not path:
+        return None
+    m = re.search(r"step(\d+)\.ckpt$", str(path)) or re.fullmatch(
+        r".*checkpoint-(\d+)", str(path).rstrip("/")
+    )
+    return int(m.group(1)) if m else None
+
+
+def _check_resume_consistency(output_dir, weights_path, resumable_dir, allow_step_restart=False):
+    """Refuse the two ways resume can silently do the wrong thing.
+
+    Weights and DeepSpeed state are chosen by two independent scans
+    (`find_latest_checkpoint` picks the highest stepN.ckpt, `_latest_resumable_checkpoint`
+    picks the highest checkpoint-N that still has global_step*/), and nothing made them agree.
+
+    A) mismatched steps -- the log says it loaded step 6000 while DeepSpeed rewinds model,
+       optimizer and scheduler to 3000. Silent, and the loss curve looks merely "a bit odd".
+    B) weights-only resume into a non-empty output_dir -- the step counter restarts at 0, so
+       the next save writes checkpoint-3000/ ON TOP of the existing one. The old warning said
+       "step numbers restart from 0" but did nothing to stop the overwrite.
+    """
+    w_step, r_step = _step_of(weights_path), _step_of(resumable_dir)
+    if w_step is not None and r_step is not None and w_step != r_step:
+        raise RuntimeError(
+            f"resume mismatch: weights are step {w_step} ({weights_path}) but the newest "
+            f"DeepSpeed state is step {r_step} ({resumable_dir}). DeepSpeed would rewind the "
+            f"model to {r_step} while the log claims {w_step}. Delete the stale checkpoint dir, "
+            f"or point --resume_ckpt_path at step{r_step}.ckpt explicitly."
+        )
+    if w_step is not None and r_step is None and not allow_step_restart:
+        existing = sorted(
+            d for d in os.listdir(output_dir)
+            if re.fullmatch(r"checkpoint-\d+", d)
+        ) if os.path.isdir(output_dir) else []
+        if existing:
+            raise RuntimeError(
+                f"weights-only resume from step {w_step}, but {output_dir} already holds "
+                f"{existing}. The step counter restarts at 0, so the next save would overwrite "
+                f"those directories and their names would stop meaning total steps. Use a fresh "
+                f"--output_dir, or pass --allow_step_restart True if overwriting is intended."
+            )
+
+
 def train(args: TrainingArguments):
     """Training function for RLBench multi-view data using HuggingFace Trainer"""
 
@@ -673,7 +855,7 @@ def train(args: TrainingArguments):
         dataset_path=args.dataset_path,
         dataset_specs=args.dataset_name,
         num_frames=args.num_frames,
-        frame_interval=1,
+        frame_interval=args.frame_interval,
         height=args.height,
         width=args.width,
         template_mix=args.template_mix,
@@ -681,6 +863,8 @@ def train(args: TrainingArguments):
         action_dropout_prob=args.action_dropout_prob,
         strict_getitem=args.strict_getitem,
         variations=args.variations,
+        segmentation_mode=args.segmentation_mode,
+        template_mix_per_dataset=args.template_mix_per_dataset,
     )
 
     # Create model
@@ -694,6 +878,9 @@ def train(args: TrainingArguments):
         tiled=args.tiled,
         tile_size=(args.tile_size_height, args.tile_size_width),
         tile_stride=(args.tile_stride_height, args.tile_stride_width),
+        perception_mask_mix=args.perception_mask_mix,
+        action_mask_mix=args.action_mask_mix,
+        fusion_mask_mix=args.fusion_mask_mix,
         full_param=args.full_param,
     )
 
@@ -712,9 +899,21 @@ def train(args: TrainingArguments):
     print(f"Local rank: {args.local_rank}, is main process: {trainer.is_world_process_zero()}")
     if use_wandb and trainer.is_world_process_zero():
         wandb.init(
-            name=f"actionimages-{args.output_dir.split('/')[-1]}",
+            # Honour --run_name when the launcher set one; the derived name is only a
+            # fallback. HfArgumentParser defaults run_name to output_dir, so treat that as
+            # "not set" rather than as an explicit choice.
+            name=(
+                args.run_name
+                if getattr(args, "run_name", None) and args.run_name != args.output_dir
+                else f"actionimages-{args.output_dir.split('/')[-1]}"
+            ),
             config={
                 "num_frames": args.num_frames,
+                # FORK: the temporal span of a window is num_frames * frame_interval, not
+                # num_frames. Two runs that differ only in this are otherwise indistinguishable
+                # in wandb, so it has to be logged alongside num_frames.
+                "frame_interval": args.frame_interval,
+                "window_span_seconds": (args.num_frames - 1) * args.frame_interval / 20.0,
                 "height": args.height,
                 "width": args.width,
                 "per_device_train_batch_size": args.per_device_train_batch_size,
@@ -737,6 +936,16 @@ def train(args: TrainingArguments):
                 "prompt_tag_style": args.prompt_tag_style,
                 "action_dropout_prob": args.action_dropout_prob,
                 "variations": args.variations,
+                "segmentation_mode": args.segmentation_mode,
+                "perception_mask_mix": args.perception_mask_mix,
+                # Logged RESOLVED, not as passed: `None` in the config would read as "no mask
+                # policy" when it actually means the A0/M0 defaults, and the whole point of
+                # recording these is that a checkpoint must be askable with the regime it saw.
+                "action_mask_mix": args.action_mask_mix,
+                "action_mask_mix_resolved": parse_action_mask_mix(args.action_mask_mix),
+                "perception_mask_mix_resolved": parse_perception_mask_mix(args.perception_mask_mix),
+                "fusion_mask_mix": args.fusion_mask_mix,
+                "fusion_mask_mix_resolved": parse_fusion_mask_mix(args.fusion_mask_mix),
                 "dataset_name": args.dataset_name,
                 "training_package": training_pkg,
             },
@@ -761,6 +970,10 @@ def train(args: TrainingArguments):
     # Resolve the disagreement here: resume optimizer state only from a directory that really
     # has it, and otherwise continue from the weights alone rather than refusing to start.
     resumable = _latest_resumable_checkpoint(args.output_dir)
+    _check_resume_consistency(
+        args.output_dir, args.resume_ckpt_path, resumable,
+        allow_step_restart=getattr(args, "allow_step_restart", False),
+    )
     if resumable is not None:
         logger.info(f"resuming optimizer/scheduler state from {resumable}")
         trainer.train(resume_from_checkpoint=resumable)
@@ -790,5 +1003,13 @@ def train(args: TrainingArguments):
 
 if __name__ == "__main__":
     args = parse_args()
-    args.seed += get_rank()
+    # NOTE: do NOT offset the seed per rank. `args.seed` is what Trainer uses to seed the
+    # RandomSampler's generator, and Accelerate's batch sharding assumes every rank draws the
+    # SAME global permutation and then takes its own slice. Giving rank r seed 42+r makes the
+    # permutations differ, so the slices stop partitioning: measured on a 2-rank / 1000-sample
+    # run, 258 indices were visited by both ranks and 258 were never visited at all.
+    # Per-rank randomness is already handled where it belongs -- transformers seeds each
+    # dataloader worker with `num_workers * rank + init_seed` (trainer_utils.seed_worker,
+    # wired at trainer.py with rank=args.process_index), so frame windows, view pairs and
+    # template draws still differ across ranks with this line gone.
     train(args)

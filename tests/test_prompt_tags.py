@@ -34,8 +34,12 @@ TOKENIZER_DIR = os.path.join(REPO, "checkpoints", "Wan-AI", "Wan2.2-TI2V-5B", "g
 INSTRUCTION = "grip the bottom handle and pull the bottom drawer open"
 SEG_COLORS = {"jar lid": "red", "jar": "green"}
 
+# The last three are arm7's substitution family. They matter here for the same reason the rest
+# do: the tag is what an eval script must ask the checkpoint with, so a tag that does not survive
+# the scrub or the tokenizer is a silent train/eval split (see project_actionimages_cogen_prompt
+# _scrub_trap -- `<scene_seg>` was exactly that bug).
 TEMPLATES = ["video+action", "video+depth", "video+segmentation", "video+depth+action",
-             "depth+action"]
+             "depth+action", "segmentation+action", "normal+action"]
 
 
 def scrub(text):
@@ -115,9 +119,12 @@ def main():
     #    recipe relative to the control arm.
     from training.dataset import RLBenchSelfgenDataset
 
+    # 512_aug: the bare "rlbench_selfgen" symlink dangles (the 256 v2 tree was deleted), which
+    # made this check die with `Found 0 episodes` instead of running.
     ds = RLBenchSelfgenDataset(
-        base_path=os.path.join(REPO, "data", "rlbench_selfgen"),
-        num_frames=41, frame_interval=1, height=256, width=256,
+        base_path=os.environ.get("SELFGEN_TEST_DATA",
+                                 os.path.join(REPO, "data", "rlbench_selfgen_512_aug")),
+        num_frames=41, frame_interval=1, height=512, width=512,
     )
     path = ds.episodes[0]["path"]
     assert "rlbench" in path, (

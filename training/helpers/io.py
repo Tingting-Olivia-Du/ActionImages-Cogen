@@ -15,7 +15,15 @@ def load_video_frames(
     frame_interval: int = 1,
     frame_process: Callable = lambda x: x,
 ) -> Tuple[torch.Tensor, List[int], Tuple[int, int]]:
-    """Load frames from video file."""
+    """Load frames from video file.
+
+    The window spans `1 + (max_frames - 1) * frame_interval` source frames, and has more than
+    one legal start only when `total_frames > max_frames * frame_interval`. Shorter videos are
+    served at the requested stride and then held on the final frame.
+    """
+    if not isinstance(frame_interval, int) or frame_interval < 1:
+        raise ValueError(f"frame_interval must be a positive int, got {frame_interval!r}")
+
     reader = imageio.get_reader(video_path)
     total_frames = reader.count_frames()
     W, H = reader.get_meta_data()["size"]
@@ -25,7 +33,15 @@ def load_video_frames(
     if frame_indices is not None:
         frame_indices = frame_indices[:max_frames]
     elif total_frames <= max_frames:
-        frame_indices = list(range(total_frames)) + [total_frames - 1] * (max_frames - total_frames)
+        # FORK: upstream built this branch as `range(total_frames)` + last-frame padding, which
+        # IGNORED frame_interval and silently served a stride-1 window whenever a video was
+        # shorter than max_frames. With a mixed-length dataset that quietly puts samples of two
+        # different temporal rates into the same training run -- invisible in the loss, and the
+        # exact class of bug that made "41 frames" mean two different horizons in the first
+        # place. Striding first and then padding is identical to upstream at frame_interval=1
+        # (min(i, total-1) reproduces range(total) + [total-1] * pad), so this is a no-op for
+        # every existing run and only changes behaviour where the old code was wrong.
+        frame_indices = [min(i * frame_interval, total_frames - 1) for i in range(max_frames)]
     else:
         start_idx = random.randint(0, max(0, total_frames - max_frames * frame_interval))
         frame_indices = [min(start_idx + i * frame_interval, total_frames - 1) for i in range(max_frames)]

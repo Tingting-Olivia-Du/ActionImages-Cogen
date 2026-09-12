@@ -27,8 +27,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from training.dataset import RLBenchSelfgenDataset
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SELFGEN = os.path.join(REPO, "data", "rlbench_selfgen")
-RES, NUM_FRAMES = 256, 41
+# The live tree. This used to be "rlbench_selfgen", whose symlink DANGLES (the 256 v2 tree was
+# deleted to free disk) -- so this file failed with `Found 0 episodes` on every run, and had been
+# doing so silently in the suite for as long as the tree has been gone. SELFGEN_TEST_DATA
+# overrides it. RES follows the tree: 512_aug renders at 512, and the loader would silently
+# downsample a 256 request rather than complain.
+SELFGEN = os.environ.get("SELFGEN_TEST_DATA", os.path.join(REPO, "data", "rlbench_selfgen_512_aug"))
+RES, NUM_FRAMES = 512, 41
 
 OFFICIAL_KEYS = {"text", "video", "camera", "extrinsics", "intrinsics",
                  "action_7d", "action_8d", "path"}
@@ -72,9 +77,15 @@ def main():
     print(f"VIDEO_ACTION_OK text={s['text'][:56]!r}")
 
     # ---- 1b. prompt_tag_style=none reproduces upstream text verbatim ----
+    # Construct BOTH datasets before seeding. RLBenchSelfgenDataset.__init__ runs _self_test(),
+    # which draws samples and therefore advances the global RNG -- so seeding and then building
+    # leaves getitem with a different stream than seeding an already-built dataset, and the two
+    # samples pick different instruction paraphrases out of meta.json's three. The comparison
+    # below is only meaningful when the two draws share RNG state.
+    ds_tagged = build("video+action@1.0")
     ds_none = build("video+action@1.0", prompt_tag_style="none")
     random.seed(7)
-    tagged = build("video+action@1.0").getitem(0)
+    tagged = ds_tagged.getitem(0)
     random.seed(7)
     untagged = ds_none.getitem(0)
     assert not untagged["text"].startswith("<"), untagged["text"][:40]
@@ -115,6 +126,32 @@ def main():
     assert "video" not in s["template"].split("+"), s["template"]
     assert float(s["action_7d"].abs().sum()) > 0
     print("SUBSTITUTION_TEMPLATE_OK depth+action carries no RGB (world model, not perception)")
+
+    # ---- 4b. arm7's other two substitution templates behave the same way ----
+    # These are new in arm7 and had never been served before it, so the properties that make the
+    # menu meaningful get pinned rather than assumed: exactly one stream (the anchor), no RGB,
+    # actions INTACT (arm7's whole point is that every template carries action supervision), and
+    # a prompt whose tags match the streams. `<scene-seg>` rather than `<seg:` because arm7 runs
+    # scene_roles -- a checkpoint asked with the other tag is being asked a different question.
+    for mix, want_streams, want_prefix, kw in (
+        ("segmentation+action@1.0", {"segmentation"}, "<scene-seg><action> ",
+         {"segmentation_mode": "scene_roles"}),
+        ("normal+action@1.0", {"normal"}, "<normal><action> ", {}),
+    ):
+        ds = build(mix, **kw)
+        s = ds[0]
+        check_shapes(s)
+        assert s["template"] == mix.split("@")[0], s["template"]
+        assert set(s["streams"]) == want_streams, sorted(s["streams"])
+        assert "video" not in s["template"].split("+"), s["template"]
+        assert s["text"].startswith(want_prefix), s["text"][:48]
+        assert float(s["action_7d"].abs().sum()) > 0, (
+            f"{mix} has zeroed actions -- an action-bearing template with no action supervision "
+            f"is exactly what arm7 exists to avoid")
+        # `video` is the back-compat alias for the anchor, so it must BE the anchor stream here.
+        assert torch.equal(s["video"], s["streams"][next(iter(want_streams))]), mix
+        print(f"ARM7_TEMPLATE_OK {s['template']} streams={sorted(s['streams'])} "
+              f"prompt={s['text'][:40]!r}")
 
     # ---- 5. BOTH views of a perception modality, not just the target one ----
     # super().getitem() draws a random window and view pair, so the two calls below MUST be

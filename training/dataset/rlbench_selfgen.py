@@ -39,6 +39,7 @@ See /workspace/ttdu/ttd/plan/core/16-multitask_template_design.md (the template 
 15-a4_io_current_vs_desired_action_perception_cogen.md (§3 for why no output head is needed,
 §6.2 for why co-supervision is the point), plus this repo's FORK_CHANGES.md.
 """
+import glob
 import json
 import os
 import random
@@ -52,9 +53,13 @@ from einops import rearrange
 
 from training.dataset.rlbench import RLBenchMVDataset
 from training.percep.depth_codec import encode_depth
+from training.percep.normal_codec import encode_normal_from_depth
 from training.percep.seg_codec import (
+    UNKNOWN_LABEL,
     build_referring_spec,
+    build_role_lut,
     encode_known_color,
+    encode_scene_roles,
     handles_to_mask,
 )
 from training.templates import (
@@ -78,9 +83,22 @@ PERCEPTION_MODALITIES = tuple(m for m in VISUAL_MODALITIES if m != "video")
 # the 70% that a round of episode generation produced.
 SEG_COVERAGE_MIN_MISSING_TO_RAISE = 0.10
 
+# How many episodes _check_scene_roles_ready opens at startup. Each one decompresses two full
+# mask volumes (~200x512x512 uint16), so this trades a few seconds of startup against how likely
+# a localised annotation gap is to be caught. 4 spread across the index hits 4 different tasks;
+# scripts/audit_scene_roles.py is the exhaustive check for when that is not enough.
+SCENE_ROLES_PROBE_EPISODES = 4
+
 
 class RLBenchSelfgenDataset(RLBenchMVDataset):
     """RLBench selfgen episodes; `template_mix` picks which task template each sample teaches."""
+
+    # The only tree with per-frame depth/mask GT, hence the only one that can serve a
+    # perception template.
+    AVAILABLE_MODALITIES = ("video", "depth", "segmentation", "normal", "action")
+    # getitem below applies the template itself (it must also build the perception streams);
+    # letting BaseDataset do it too would prepend the prompt tags twice.
+    TEMPLATE_IN_BASE = False
 
     def _try_load_cache(self) -> bool:
         """Always rescan self-generated data, which may grow between training runs.
@@ -98,11 +116,20 @@ class RLBenchSelfgenDataset(RLBenchMVDataset):
 
     def __init__(self, *args, template_mix: str = "video+action@1.0",
                  prompt_tag_style: str = "explicit", action_dropout_prob: float = 0.1,
-                 strict_getitem: bool = False, variations: str = "all", **kwargs):
+                 strict_getitem: bool = False, variations: str = "all",
+                 segmentation_mode: str = "referring",
+                 legacy_scene_seg_tag: bool = False, **kwargs):
         self.strict_getitem = strict_getitem
         self.variations = variations
         self.prompt_tag_style = prompt_tag_style
         self.action_dropout_prob = float(action_dropout_prob)
+        if segmentation_mode not in ("referring", "scene_roles"):
+            raise ValueError(
+                f"segmentation_mode must be 'referring' or 'scene_roles', got {segmentation_mode!r}"
+            )
+        self.segmentation_mode = segmentation_mode
+        # Only for evaluating pre-2026-08-23 checkpoints; see templates.scene_seg_tag_legacy.
+        self.legacy_scene_seg_tag = bool(legacy_scene_seg_tag)
         self._templates, self._template_cum = parse_template_mix(template_mix)
         # {(task, group_name): count} of seg samples where build_referring_spec silently dropped
         # a defined-but-zero-handle group (e.g. reach_and_drag's "target" when target0 is
@@ -119,6 +146,7 @@ class RLBenchSelfgenDataset(RLBenchMVDataset):
 
         self._apply_variation_filter()
         self._check_seg_coverage()
+        self._check_scene_roles_ready()
         self._self_test()
 
     def _check_seg_coverage(self) -> None:
@@ -139,11 +167,22 @@ class RLBenchSelfgenDataset(RLBenchMVDataset):
         """
         if not any("segmentation" in mods for mods in self._templates):
             return
+        # WHICH FILE MATTERS DEPENDS ON THE PROTOCOL. Under `referring`, seg_targets.json IS the
+        # signal, and its absence is what silently degrades the sample (the failure this guard was
+        # written for). Under `scene_roles` the drop decision in getitem keys off `role_lut is
+        # None`, i.e. off scene_segments.json; seg_targets.json is consulted only for the optional
+        # instruction overlay that promotes a `distractor` to `target`, and _scene_role_lut states
+        # outright that its absence is "NOT fatal". Checking seg_targets under scene_roles
+        # therefore rejects trees that would evaluate perfectly well -- which is exactly what it
+        # did to the never-trained-task tree, whose episodes carry scene_segments.json and no
+        # seg_targets.json.
+        required = ("scene_segments.json" if self.segmentation_mode == "scene_roles"
+                    else "seg_targets.json")
         missing = [ep["path"] for ep in self.episodes
-                   if not os.path.exists(os.path.join(ep["path"], "seg_targets.json"))]
+                   if not os.path.exists(os.path.join(ep["path"], required))]
         if not missing:
             print(f"[selfgen] seg coverage OK: {len(self.episodes)}/{len(self.episodes)} "
-                  f"episodes carry seg_targets.json")
+                  f"episodes carry {required}")
             return
         frac = len(missing) / max(len(self.episodes), 1)
         # parse_template_mix returns CUMULATIVE probabilities; recover the per-template share.
@@ -155,17 +194,89 @@ class RLBenchSelfgenDataset(RLBenchMVDataset):
             prev = cum
         msg = (
             f"{len(missing)}/{len(self.episodes)} episodes ({frac:.1%}) have no "
-            f"seg_targets.json, e.g. {missing[0]}.\n"
+            f"{required}, e.g. {missing[0]}.\n"
             f"  Those samples DROP segmentation and become plain `video` samples -- silently.\n"
             f"  With seg weight {seg_weight:.0%} in template_mix, about {seg_weight * frac:.1%} "
             f"of ALL training samples become video-only (no action, no perception), which is a\n"
             f"  confound a control arm does not share.\n"
-            f"  Fix: run ttd's src/percep/seg_targets_gen.py over the tree, or drop the "
+            f"  Fix: run `python -m training.percep.scene_segments_gen --root <tree> --write` "
+            f"(scene_roles) or ttd's src/percep/seg_targets_gen.py (referring), or drop the "
             f"segmentation template from --template_mix."
         )
         if frac > SEG_COVERAGE_MIN_MISSING_TO_RAISE:
             raise RuntimeError("[selfgen] seg coverage too low: " + msg)
         print("[selfgen] WARNING: partial seg coverage: " + msg)
+
+    def _check_scene_roles_ready(self) -> None:
+        """Refuse to start a scene_roles run whose target would contain `unknown` pixels.
+
+        `scene_roles` has one hard invariant (SEGMENTATION_SCENE_ROLES_PLAN.md 12.1): the
+        `unknown` role -- orange, meaning "a rendered handle nobody assigned a role" -- must not
+        appear in training data. It is the only role whose presence is always a metadata bug
+        rather than a property of the scene.
+
+        It went undetected once already. RLBench's "no object" sentinel (the sky above the walls)
+        reached the LUT unmapped and painted 5.2% of ALL pixels orange -- up to 52.9% of a single
+        view -- while every instrument stayed green: the loss is a plain MSE against whatever the
+        target is, `_self_test` only checks that a template does not degrade, and the one test
+        that did check pointed at a data root whose symlink had gone dangling. Two more handles
+        (Panda_link0/link1, absent from some episodes' 3-frame handles.json sample) survived even
+        the first fix. So the check belongs at startup, where it costs four episodes of IO and
+        cannot be skipped, rather than only in a test file.
+
+        scripts/audit_scene_roles.py is the exhaustive version; this is the cheap gate.
+        """
+        if self.segmentation_mode != "scene_roles":
+            return
+        if not any("segmentation" in mods for mods in self._templates):
+            return
+        missing = [ep["path"] for ep in self.episodes
+                   if not os.path.exists(os.path.join(ep["path"], "scene_segments.json"))]
+        if missing:
+            frac = len(missing) / max(len(self.episodes), 1)
+            msg = (
+                f"[selfgen] {len(missing)}/{len(self.episodes)} episodes ({frac:.1%}) have no "
+                f"scene_segments.json, e.g. {missing[0]}.\n"
+                f"  Under --segmentation_mode scene_roles those samples DROP segmentation and "
+                f"become plain `video` samples -- silently.\n"
+                f"  Fix: python -m training.percep.scene_segments_gen "
+                f"--root <tree> --write --verify-masks"
+            )
+            if frac > SEG_COVERAGE_MIN_MISSING_TO_RAISE:
+                raise RuntimeError(msg)
+            print("[selfgen] WARNING: " + msg)
+
+        # Probe a spread of episodes, not the first few: episodes are grouped by task on disk and
+        # the sentinel's incidence is task- and camera-dependent.
+        n = len(self.episodes)
+        probe = sorted({(i * n) // SCENE_ROLES_PROBE_EPISODES for i in range(SCENE_ROLES_PROBE_EPISODES)})
+        worst = (0, None)
+        checked = 0
+        for i in probe:
+            ep = self.episodes[i]["path"]
+            meta = self._load_meta(ep)
+            lut, _ = self._scene_role_lut(ep, meta["desc"][0])
+            if lut is None:
+                continue
+            for view in sorted(glob.glob(os.path.join(ep, "view*")))[:2]:
+                mask_path = os.path.join(view, "mask.npz")
+                if not os.path.exists(mask_path):
+                    continue
+                labels = lut[np.load(mask_path)["mask"].astype(np.intp)]
+                unk = int((labels == UNKNOWN_LABEL).sum())
+                checked += 1
+                if unk > worst[0]:
+                    worst = (unk, view)
+        if worst[0]:
+            raise RuntimeError(
+                f"[selfgen] scene_roles target contains {worst[0]} `unknown` (orange) pixels, "
+                f"worst at {worst[1]}.\n"
+                f"  An unmapped handle reached the training target. Run "
+                f"`python scripts/audit_scene_roles.py --root {self.base_path}` for the full "
+                f"list, then regenerate scene_segments.json.\n"
+                f"  See SEGMENTATION_SCENE_ROLES_PLAN.md 12.1 -- this class must be absent."
+            )
+        print(f"[selfgen] scene_roles OK: zero `unknown` pixels over {checked} probed views")
 
     def _apply_variation_filter(self) -> None:
         """Keep only the variations this split is allowed to see.
@@ -302,6 +413,24 @@ class RLBenchSelfgenDataset(RLBenchMVDataset):
     def _load_depth(self, view_path: str) -> np.ndarray:
         return np.load(os.path.join(view_path, "depth.npz"))["depth"]  # [T,H,W] float16
 
+    @lru_cache(maxsize=32)
+    def _focal_lengths(self, view_path: str):
+        """-> (|fx|, |fy|) in pixels at the NATIVE render resolution.
+
+        Frame 0 only: intrinsics do not vary within an episode -- the Colosseum augmentation
+        randomises camera POSE, table and lighting, never the lens (verified over 80 view dirs
+        spanning all 16 tasks: zero episodes have a per-frame intrinsics change). Reading one
+        frame instead of `num_frames` keeps this off the hot path.
+
+        Magnitudes: RLBench writes fx and fy negative because its image y axis points opposite
+        the pinhole convention. normal_codec takes abs() too; doing it here as well means a
+        caller reading this value for anything else does not inherit the sign trap.
+        """
+        with open(os.path.join(view_path, "camera_params.json")) as f:
+            cam = json.load(f)
+        k = cam[min(cam.keys(), key=lambda x: int(x))]["intrinsics"]
+        return abs(float(k[0][0])), abs(float(k[1][1]))
+
     @lru_cache(maxsize=4)
     def _load_mask(self, view_path: str) -> np.ndarray:
         return np.load(os.path.join(view_path, "mask.npz"))["mask"]  # [T,H,W] uint16
@@ -342,6 +471,71 @@ class RLBenchSelfgenDataset(RLBenchMVDataset):
                 self._seg_dropped_group_counts[key] = self._seg_dropped_group_counts.get(key, 0) + 1
         return id_groups, color_map
 
+    @lru_cache(maxsize=64)
+    def _load_scene_segments(self, episode_path: str) -> Optional[dict]:
+        """episode_path/scene_segments.json -> {"instances": {name: {handles, base_role}}}.
+
+        Deliberately holds NO target/goal resolution. Those depend on the instruction
+        (push_buttons and put_groceries_in_cupboard both pick their target from the text), and
+        seg_targets.json + build_referring_spec is already the single source of truth for that
+        (SEGMENTATION_SCENE_ROLES_PLAN.md §7.1). Storing a second copy here is how the two
+        would drift apart while every acceptance check kept passing.
+        """
+        p = os.path.join(episode_path, "scene_segments.json")
+        if not os.path.exists(p):
+            return None
+        with open(p) as f:
+            return json.load(f)
+
+    def _scene_role_lut(self, episode_path: str, instruction: str):
+        """-> (uint8 LUT[65536] handle->role label, sorted list of roles present), or (None, None).
+
+        Composition order IS the role priority (§6.3): every handle first takes its
+        instruction-independent `base_role`, then the instruction's referred groups overwrite
+        theirs with `target`. Only that one level actually conflicts -- gripper and robot_arm
+        handle sets are disjoint, so their relative order never matters.
+        """
+        scene = self._load_scene_segments(episode_path)
+        if not scene:
+            return None, None
+        handle_to_role = {}
+        for inst in scene.get("instances", {}).values():
+            role = inst.get("base_role")
+            if role is None:
+                continue
+            for h in inst.get("handles", []):
+                handle_to_role[int(h)] = role
+        if not handle_to_role:
+            return None, None
+
+        # Instruction-dependent overlay. A missing/unresolvable seg_targets.json is NOT fatal
+        # here (unlike the referring protocol, where it is the entire signal): the scene still
+        # has robot, fixtures and distractors to supervise.
+        #
+        # seg_targets.json lists every object the instruction REFERS TO, which is not the same
+        # as the object being manipulated: 9 of the 16 tasks name two or three (put_item_in_drawer
+        # names the item AND the drawer; sweep_to_dustpan names broom, dirt AND dustpan). Marking
+        # all of them `target` would repaint the receptacle and the implement red and destroy
+        # exactly the goal/tool distinction this protocol exists to express.
+        #
+        # So the two sources are combined by what each actually knows. seg_targets knows "the
+        # instruction mentions this object" (and resolves the episode-random colour cases);
+        # scene_segments knows "this object is a receptacle / implement / fixture". A referred
+        # object is promoted to `target` only where its base role says it is a manipulable
+        # object; a referred goal stays a goal. That is §6.3's `target > goal > tool > fixture`
+        # chain read correctly -- the chain disambiguates an object that qualifies for several
+        # roles, it does not licence overwriting a more specific role with a less specific one.
+        PROMOTABLE = {"distractor"}
+        id_groups, _ = self._referred_id_groups(episode_path, instruction)
+        for handles in id_groups.values():
+            for h in handles:
+                if handle_to_role.get(int(h)) in PROMOTABLE:
+                    handle_to_role[int(h)] = "target"
+
+        lut = build_role_lut(handle_to_role)
+        present = sorted(set(handle_to_role.values()) | {"background"})
+        return lut, present
+
     def _to_model_res(self, gt: np.ndarray) -> np.ndarray:
         """[T,H,W] annotation at native render resolution -> [T,height,width], NEAREST.
 
@@ -371,12 +565,27 @@ class RLBenchSelfgenDataset(RLBenchMVDataset):
         if modality == "depth":
             depth = self._to_model_res(self._load_depth(view_path)[frame_indices].astype(np.float32))
             rgb = encode_depth(depth)  # [T,H,W,3] uint8
+        elif modality == "normal":
+            raw = self._load_depth(view_path)[frame_indices].astype(np.float32)
+            fx, fy = self._focal_lengths(view_path)
+            # _to_model_res subsamples the depth grid, so one pixel spans more of the scene and
+            # the focal length IN PIXELS shrinks by exactly that factor. Without this rescale a
+            # 256 arm's normals are tilted ~2x relative to a 512 arm's from identical geometry --
+            # and nothing downstream would flag it, because the result is still a unit field.
+            sx, sy = self.width / raw.shape[-1], self.height / raw.shape[-2]
+            depth = self._to_model_res(raw)
+            rgb = encode_normal_from_depth(depth, fx * sx, fy * sy)  # [T,H,W,3] uint8
         elif modality == "segmentation":
             mask_map = self._to_model_res(self._load_mask(view_path)[frame_indices]).astype(np.uint16)
-            instance_masks = {
-                name: handles_to_mask(mask_map, ids) for name, ids in ctx["id_groups"].items()
-            }
-            rgb = encode_known_color(instance_masks, ctx["color_map"])  # [T,H,W,3] uint8
+            if "role_lut" in ctx:
+                # Scene roles: pure LUT indexing. No per-instance masks and therefore no paint
+                # order -- the handle map already assigns each pixel to exactly one handle.
+                rgb = encode_scene_roles(mask_map, ctx["role_lut"])  # [T,H,W,3] uint8
+            else:
+                instance_masks = {
+                    name: handles_to_mask(mask_map, ids) for name, ids in ctx["id_groups"].items()
+                }
+                rgb = encode_known_color(instance_masks, ctx["color_map"])  # [T,H,W,3] uint8
         else:
             raise ValueError(f"not a perception modality: {modality!r}")
         assert rgb.shape == (len(frame_indices), self.height, self.width, 3), (
@@ -403,19 +612,42 @@ class RLBenchSelfgenDataset(RLBenchMVDataset):
 
         color_map = None
         ctx: dict = {}
+        # ORDERING IS LOAD-BEARING. Both seg protocols resolve their object handles by matching
+        # words of the INSTRUCTION against seg_targets.json. `sample["text"]` is still the bare
+        # instruction at this point; the prompt prefix is prepended at the END of this method.
+        # Reversing the two would feed `<video><seg: ...> pick up the lid` into the matcher,
+        # resolve nothing, and silently degrade the sample to video-only -- with a normal-looking
+        # loss curve. Assert rather than trust, because the failure is invisible downstream.
+        assert not sample["text"].startswith("<"), (
+            f"seg context must be resolved from the raw instruction, but sample['text'] is "
+            f"already prefixed: {sample['text'][:60]!r}. The prompt_prefix() call at the end of "
+            f"getitem must stay AFTER this block."
+        )
         if "segmentation" in mods:
-            id_groups, color_map = self._referred_id_groups(sample["path"], sample["text"])
-            if not id_groups:
-                # Nothing in this episode's seg_targets.json resolves for this instruction.
-                # Drop segmentation rather than emit an all-empty target, which would teach a
-                # bogus "usually nothing to segment" prior. Fall back to RGB if that would
-                # leave the sequence with no visual anchor at all.
-                mods = tuple(m for m in mods if m != "segmentation")
-                color_map = None
-                if not any(m in VISUAL_MODALITIES for m in mods):
-                    mods = ("video",) + mods
+            if self.segmentation_mode == "scene_roles":
+                role_lut, present_roles = self._scene_role_lut(sample["path"], sample["text"])
+                if role_lut is None:
+                    # No scene_segments.json for this episode (or it resolves nothing). Same
+                    # policy as referring below: drop segmentation rather than emit a degenerate
+                    # target. An all-background role map would teach "the scene is empty".
+                    mods = tuple(m for m in mods if m != "segmentation")
+                    if not any(m in VISUAL_MODALITIES for m in mods):
+                        mods = ("video",) + mods
+                else:
+                    ctx = {"role_lut": role_lut, "present_roles": present_roles}
             else:
-                ctx = {"id_groups": id_groups, "color_map": color_map}
+                id_groups, color_map = self._referred_id_groups(sample["path"], sample["text"])
+                if not id_groups:
+                    # Nothing in this episode's seg_targets.json resolves for this instruction.
+                    # Drop segmentation rather than emit an all-empty target, which would teach a
+                    # bogus "usually nothing to segment" prior. Fall back to RGB if that would
+                    # leave the sequence with no visual anchor at all.
+                    mods = tuple(m for m in mods if m != "segmentation")
+                    color_map = None
+                    if not any(m in VISUAL_MODALITIES for m in mods):
+                        mods = ("video",) + mods
+                else:
+                    ctx = {"id_groups": id_groups, "color_map": color_map}
 
         perception = [m for m in mods if m in PERCEPTION_MODALITIES]
         streams = {}
@@ -453,7 +685,16 @@ class RLBenchSelfgenDataset(RLBenchMVDataset):
         # exactly the previous revision's behaviour.
         sample["video"] = streams[primary_visual(mods)]
         sample["visual_modality"] = primary_visual(mods)
-        sample["text"] = prompt_prefix(mods, color_map, self.prompt_tag_style) + sample["text"]
+        # Applied LAST, and exactly once: everything above that reads `sample["text"]` needs the
+        # bare instruction (see the assert near the top of this method).
+        assert not sample["text"].startswith("<"), (
+            f"prompt prefix applied twice: {sample['text'][:60]!r}"
+        )
+        sample["text"] = (
+            prompt_prefix(mods, color_map, self.prompt_tag_style, self.segmentation_mode,
+                          legacy_scene_seg_tag=self.legacy_scene_seg_tag)
+            + sample["text"]
+        )
         # NOTE: action_7d / action_8d are deliberately left INTACT. Zeroing them is what made
         # perception and action mutually exclusive in ttd; keeping them is what makes
         # video+depth+action co-supervision happen at all.

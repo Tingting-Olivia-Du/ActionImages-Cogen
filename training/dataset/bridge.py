@@ -11,6 +11,12 @@ from training.helpers.io import load_video_frames
 
 
 class BridgeMVDataset(BaseDataset):
+    # FORK: Bridge ships no camera calibration, so its actions cannot be projected into
+    # pixels -- Action-Images Tab.1 marks it "Cam. Calib. x" and the paper uses it for
+    # video-only generation. get_7d_action returns zeros accordingly, so `action` is NOT a
+    # modality this tree can serve; asking for it would silently degrade to `video`.
+    AVAILABLE_MODALITIES = ("video",)
+
     """
     Bridge multi-view dataset implementation.
 

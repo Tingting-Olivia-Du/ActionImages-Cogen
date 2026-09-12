@@ -1,4 +1,6 @@
 data
+papper
+wandb
 tmp
 checkpoints
 outputs
@@ -6,6 +8,19 @@ wandb
 results
 slurm
 cache
+.gpulease/
+.qrun/
+
+# Generated evaluation/report artifacts can contain multi-GB arrays and videos.
+reports/
+eval_results*/
+comparisons_perception/
+
+# Model and optimizer checkpoints belong in the Hugging Face model repos.
+*.ckpt
+*.safetensors
+*_model_states.pt
+*_optim_states.pt
 .vscode
 .deepspeed_env
 env*

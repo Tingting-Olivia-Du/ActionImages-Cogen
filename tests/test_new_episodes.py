@@ -42,8 +42,13 @@ from training.percep.seg_codec import build_referring_spec, decode_known_color, 
 from training.utils import convert_intrinsics_after_center_crop_resize, get_relative_pose_batch
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SELFGEN = os.path.join(REPO, "data", "rlbench_selfgen")
-RES, NUM_FRAMES = 256, 41
+# The live tree. This used to be "rlbench_selfgen", whose symlink DANGLES (the 256 v2 tree was
+# deleted to free disk) -- so this file failed with `Found 0 episodes` on every run, and had been
+# doing so silently in the suite for as long as the tree has been gone. SELFGEN_TEST_DATA
+# overrides it. RES follows the tree: 512_aug renders at 512, and the loader would silently
+# downsample a 256 request rather than complain.
+SELFGEN = os.environ.get("SELFGEN_TEST_DATA", os.path.join(REPO, "data", "rlbench_selfgen_512_aug"))
+RES, NUM_FRAMES = 512, 41
 ABSREL_MAX, IOU_MIN = 0.02, 0.95
 
 

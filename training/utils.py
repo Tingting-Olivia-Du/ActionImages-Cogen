@@ -898,14 +898,29 @@ def fuse_multiview_heatmaps_to_3d_point_torch(
     principal_ray_origin = t[:, 0, :]  # (B, 3)
     principal_ray_dir = ray_dirs_world[:, 0, :]  # (B, 3)
 
-    # Sample depths along the principal ray
-    depth_samples = torch.linspace(near, far, num_depth_samples, device=device, dtype=dtype)  # (D,)
+    # Sample depths along the principal ray.
+    # FORK: `near`/`far` may be per-sample tensors, not just scalars. A scalar keeps the
+    # original behaviour bit-for-bit; a tensor lets the caller search a narrow band that
+    # depends on the frame, which is what `fuse_multiview_heatmaps_to_pose_torch` needs to
+    # keep an axis point from running to the edge of a global sweep (see `constrain_axis_depth`).
+    if torch.is_tensor(near) or torch.is_tensor(far):
+        near_t = torch.as_tensor(near, device=device, dtype=dtype).reshape(-1)
+        far_t = torch.as_tensor(far, device=device, dtype=dtype).reshape(-1)
+        near_t = near_t.expand(batch_size) if near_t.numel() == 1 else near_t
+        far_t = far_t.expand(batch_size) if far_t.numel() == 1 else far_t
+        alpha = torch.linspace(0.0, 1.0, num_depth_samples, device=device, dtype=dtype)  # (D,)
+        depth_samples = near_t[:, None] + (far_t - near_t)[:, None] * alpha[None, :]  # (B, D)
+        candidate_points = (
+            principal_ray_origin[:, None, :] + principal_ray_dir[:, None, :] * depth_samples[:, :, None]
+        )  # (B, D, 3)
+    else:
+        depth_samples = torch.linspace(near, far, num_depth_samples, device=device, dtype=dtype)  # (D,)
 
-    # Generate 3D candidate points along the principal ray
-    # Shape: (B, 1, 3) + (B, 1, 3) * (D, 1) -> (B, D, 3)
-    candidate_points = (
-        principal_ray_origin[:, None, :] + principal_ray_dir[:, None, :] * depth_samples[None, :, None]
-    )  # (B, D, 3)
+        # Generate 3D candidate points along the principal ray
+        # Shape: (B, 1, 3) + (B, 1, 3) * (D, 1) -> (B, D, 3)
+        candidate_points = (
+            principal_ray_origin[:, None, :] + principal_ray_dir[:, None, :] * depth_samples[None, :, None]
+        )  # (B, D, 3)
 
     # Step 4: Score each candidate point by projecting to all views
     # For each candidate point, compute its reprojection score in all views
@@ -1082,6 +1097,22 @@ def fuse_multiview_heatmaps_to_7d_point_torch(
     Fuse multi-view RGB heatmaps into a full 7D action:
         [x, y, z, dir_x, dir_y, dir_z, gripper]
 
+    UPSTREAM FUNCTION -- DELIBERATELY LEFT AS-IS. It is the official baseline path and is
+    still what `inference.py:export_action_point_cloud_from_pred_video` calls (that consumer
+    only uses `[:3]`, so neither defect below affects it). Two known defects mean it must NOT
+    be used to produce executable poses or a gripper metric:
+
+      1. Only the R and G channels are triangulated, so `[3:6]` is a single unit direction
+         vector and the roll about it is undetermined -- not enough for IK.
+      2. `any(B > grip_close_threshold)` is degenerate: the blue channel also carries the
+         up-point Gaussian blob, whose peak is 255, so ~697 pixels exceed 128 on EVERY frame
+         regardless of openness. The bit is constant "closed" (measured accuracy 0.500).
+         Openness actually lives in the low-response BACKGROUND of that channel.
+
+    Use `fuse_multiview_heatmaps_to_pose_torch` instead, which implements the paper's full
+    decoder (Sec. 3.2) and returns [x, y, z, qx, qy, qz, qw, openness].
+    `tests/test_decode_6dof.py` pins both defects as regression tests.
+
     Encoding convention for the input heatmap video:
         - R channel: start-point heatmap (position)
         - G channel: end-point heatmap (position + direction * length)
@@ -1138,6 +1169,543 @@ def fuse_multiview_heatmaps_to_7d_point_torch(
     action_7d = torch.cat([state_6d, gripper_state], dim=-1)  # [..., 7]
 
     return action_7d
+
+
+def decode_gripper_openness_torch(
+    blue_channel: torch.Tensor,  # [..., V, H, W], values in [0, 255]
+    mode: str = "paper",
+    low_response_threshold: float = 0.25,
+) -> torch.Tensor:
+    """
+    Decode gripper openness from the blue channel background level.
+
+    FORK: new. The encoder (`project_action_5d_to_rgb_torch`) writes openness into the
+    LOW-RESPONSE background of the blue channel:
+
+        B = gaussian(up_point)               # peak 1.0
+        B[B <= 0.25] = openness * 0.25       # pedestal at 0.25 (open) or 0.0 (closed)
+
+    so recovering openness means estimating that pedestal level and dividing by 0.25.
+    This is paper Sec. 3.2 Eq. (7). The shipped `fuse_multiview_heatmaps_to_7d_point_torch`
+    does something else entirely (`any(B > 128)`), which is degenerate -- see the note in
+    that function.
+
+    Args:
+        blue_channel: Blue channel of the action image, shape [..., V, H, W], scale [0, 255].
+        mode:
+            "paper"  -- Eq. (7): mean of the low-response pixels, divided by 0.25.
+                        NOTE the boundary convention: the paper writes the selection set as
+                        {A < 0.25} (strict), but the encoder fills the pedestal using a
+                        `B <= 0.25` mask and writes exactly 0.25 on an OPEN frame. With a
+                        strict `<` the selected set is therefore EMPTY on every open frame
+                        (measured: 0 pixels vs 128217 for `<=`), and the estimate collapses
+                        to 0 for all frames. We select with `<=`, which is the encoder's own
+                        mask and makes the formula exact on clean renders (1.0000 / 0.0000).
+            "median" -- same estimand, robust estimator: median over all pixels / 0.25.
+                        The background occupies ~98% of the frame so the median lands on the
+                        pedestal. Prefer this on GENERATED images: the threshold-selected
+                        mean is biased low once the pedestal is blurred/noised (measured
+                        ghat_open 1.00 -> 0.94 -> 0.84 -> 0.68 -> 0.44 as noise grows, and it
+                        flips the decision at the last step), while the median stays at
+                        1.00-1.01 throughout.
+        low_response_threshold: The 0.25 constant from the encoder. Do not change unless
+            `project_action_5d_to_rgb_torch` changes with it.
+
+    Returns:
+        torch.Tensor of shape [...]: continuous openness estimate, nominally in [0, 1].
+        Threshold at 0.5 for a binary open/closed decision.
+    """
+    b = blue_channel.to(torch.float32) / 255.0
+    *batch_dims, V, H, W = b.shape
+    flat = b.reshape(*batch_dims, V * H * W) if batch_dims else b.reshape(1, V * H * W)
+
+    if mode == "median":
+        est = flat.median(dim=-1).values
+    elif mode == "paper":
+        low = flat <= low_response_threshold
+        count = low.sum(dim=-1)
+        est = (flat * low).sum(dim=-1) / count.clamp(min=1)
+        # If no pixel qualifies the formula is undefined; the encoder guarantees a pedestal
+        # exists, so this only fires on badly corrupted input. Fall back to the median rather
+        # than silently reporting "closed".
+        est = torch.where(count > 0, est, flat.median(dim=-1).values)
+    else:
+        raise ValueError(f"unknown gripper decode mode {mode!r}, expected 'paper' or 'median'")
+
+    openness = est / low_response_threshold
+    return openness.reshape(*batch_dims) if batch_dims else openness.reshape(())
+
+
+def rotation_matrix_to_quaternion_xyzw(rot: torch.Tensor) -> torch.Tensor:
+    """
+    Convert rotation matrices to quaternions in (x, y, z, w) order.
+
+    FORK: new. Kept in torch (no scipy) so the decoder stays differentiable and device-
+    agnostic. The (x, y, z, w) order matches PyRep/RLBench `gripper_pose[3:7]` and
+    `scipy.spatial.transform.Rotation.from_quat`, i.e. the same convention
+    `RLBenchMVDataset.get_7d_action` already assumes.
+
+    Args:
+        rot: Rotation matrices of shape [..., 3, 3].
+
+    Returns:
+        torch.Tensor of shape [..., 4] -- (qx, qy, qz, qw), with qw >= 0.
+    """
+    m = rot.reshape(-1, 3, 3)
+    trace = m[:, 0, 0] + m[:, 1, 1] + m[:, 2, 2]
+    q = torch.zeros(m.shape[0], 4, dtype=m.dtype, device=m.device)
+
+    # Branch on the largest diagonal term for numerical stability (Shepperd's method).
+    t0 = trace > 0
+    t1 = (~t0) & (m[:, 0, 0] >= m[:, 1, 1]) & (m[:, 0, 0] >= m[:, 2, 2])
+    t2 = (~t0) & (~t1) & (m[:, 1, 1] >= m[:, 2, 2])
+    t3 = ~(t0 | t1 | t2)
+
+    def _fill(mask, s, qx, qy, qz, qw):
+        if mask.any():
+            q[mask, 0] = qx / s
+            q[mask, 1] = qy / s
+            q[mask, 2] = qz / s
+            q[mask, 3] = qw / s
+
+    if t0.any():
+        s = torch.sqrt(trace[t0] + 1.0) * 2.0
+        mm = m[t0]
+        _fill(t0, s, mm[:, 2, 1] - mm[:, 1, 2], mm[:, 0, 2] - mm[:, 2, 0], mm[:, 1, 0] - mm[:, 0, 1], 0.25 * s * s)
+    if t1.any():
+        mm = m[t1]
+        s = torch.sqrt(1.0 + mm[:, 0, 0] - mm[:, 1, 1] - mm[:, 2, 2]) * 2.0
+        _fill(t1, s, 0.25 * s * s, mm[:, 0, 1] + mm[:, 1, 0], mm[:, 0, 2] + mm[:, 2, 0], mm[:, 2, 1] - mm[:, 1, 2])
+    if t2.any():
+        mm = m[t2]
+        s = torch.sqrt(1.0 + mm[:, 1, 1] - mm[:, 0, 0] - mm[:, 2, 2]) * 2.0
+        _fill(t2, s, mm[:, 0, 1] + mm[:, 1, 0], 0.25 * s * s, mm[:, 1, 2] + mm[:, 2, 1], mm[:, 0, 2] - mm[:, 2, 0])
+    if t3.any():
+        mm = m[t3]
+        s = torch.sqrt(1.0 + mm[:, 2, 2] - mm[:, 0, 0] - mm[:, 1, 1]) * 2.0
+        _fill(t3, s, mm[:, 0, 2] + mm[:, 2, 0], mm[:, 1, 2] + mm[:, 2, 1], 0.25 * s * s, mm[:, 1, 0] - mm[:, 0, 1])
+
+    q = q / q.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    q = torch.where(q[:, 3:4] < 0, -q, q)  # canonical hemisphere
+    return q.reshape(*rot.shape[:-2], 4)
+
+
+def _axis_ray_from_main_view(
+    heatmaps: torch.Tensor,  # [..., V, H, W], values in [0, 1]
+    extrinsics: torch.Tensor,  # [..., V, 3, 4]
+    intrinsics: torch.Tensor,  # [..., V, 3, 3]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The main view's ray through a heatmap's weighted centroid: `(origin, unit_direction)`.
+
+    FORK: new. Mirrors steps 1-2 of `fuse_multiview_heatmaps_to_3d_point_torch` exactly, so the
+    ray is the same one that routine casts before it searches for a depth.
+    """
+    *batch, V, H, W = heatmaps.shape
+    device, dtype = heatmaps.device, heatmaps.dtype
+    n = int(np.prod(batch)) if batch else 1
+    hm = heatmaps.reshape(n, V, H, W)
+    ext = extrinsics.to(device=device, dtype=dtype).reshape(n, V, 3, 4)
+    itr = intrinsics.to(device=device, dtype=dtype).reshape(n, V, 3, 3)
+
+    ys, xs = torch.meshgrid(torch.arange(H, device=device, dtype=dtype),
+                            torch.arange(W, device=device, dtype=dtype), indexing="ij")
+    probs = hm / (hm.sum(dim=(2, 3), keepdim=True) + 1e-8)
+    cx_pix = (probs * (xs + 0.5)[None, None]).sum(dim=(2, 3))[:, 0]
+    cy_pix = (probs * (ys + 0.5)[None, None]).sum(dim=(2, 3))[:, 0]
+
+    fx, fy = itr[:, 0, 0, 0], itr[:, 0, 1, 1]
+    cx, cy = itr[:, 0, 0, 2], itr[:, 0, 1, 2]
+    d_cam = torch.stack([(cx_pix - cx) / fx, (cy_pix - cy) / fy, torch.ones_like(cx_pix)], dim=-1)
+    d_world = torch.einsum("bij,bj->bi", ext[:, 0, :3, :3], d_cam)
+    d_world = d_world / (d_world.norm(dim=-1, keepdim=True) + 1e-8)
+    origin = ext[:, 0, :3, 3]
+    shape = (*batch, 3) if batch else (3,)
+    return origin.reshape(shape), d_world.reshape(shape)
+
+
+def _snap_axis_point_to_length(
+    q_axis: torch.Tensor,   # [..., 3] unconstrained triangulation
+    q_pos: torch.Tensor,    # [..., 3] decoded position point
+    origin: torch.Tensor,   # [..., 3] main-view camera centre
+    direction: torch.Tensor,  # [..., 3] unit ray through the axis blob's centroid
+    length: float,
+    tolerance: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Re-solve an axis point's depth using the length the ENCODER guaranteed.
+
+    `project_actions_7d_to_5d_torch_batch` places both axis points at exactly `length` metres
+    from the position point, but the decoder searches depth freely and can settle at the wrong
+    point along the ray. When it does, the direction is badly wrong while the heatmaps still
+    look perfectly healthy: measured on ground-truth renders, frames whose decoded
+    `|q_pos - q_axis|` was more than 3 cm off 0.1 m had a median axis error of 93.4 deg, versus
+    0.3 deg on the rest -- and those are exactly the frames that made closed-loop rollouts
+    unexecutable, since a ~180 deg rotation target cannot be reached by Jacobian IK.
+
+    The fix intersects the ray with the sphere of radius `length` centred at `q_pos`. Of the (at
+    most two) intersections we keep the one nearer the unconstrained estimate, which preserves
+    the triangulation's choice of branch while enforcing the known scale. Rays that miss the
+    sphere entirely are left alone and reported, so the caller can flag those frames instead of
+    trusting a fabricated point.
+
+    Returns `(q_corrected, ok)` where `ok` marks entries whose length is now trustworthy.
+    """
+    oc = origin - q_pos
+    b = 2.0 * (direction * oc).sum(-1)
+    c = (oc * oc).sum(-1) - length * length
+    disc = b * b - 4.0 * c
+    hit = disc >= 0
+    sq = torch.sqrt(disc.clamp(min=0))
+    t1, t2 = (-b - sq) / 2.0, (-b + sq) / 2.0
+    p1 = origin + t1[..., None] * direction
+    p2 = origin + t2[..., None] * direction
+    # Keep the branch the free search already preferred.
+    pick2 = (p2 - q_axis).norm(dim=-1) < (p1 - q_axis).norm(dim=-1)
+    snapped = torch.where(pick2[..., None], p2, p1)
+    # A point in front of the camera only; a negative depth is not a real solution.
+    hit = hit & (torch.where(pick2, t2, t1) > 0)
+    corrected = torch.where(hit[..., None], snapped, q_axis)
+    already_ok = ((q_axis - q_pos).norm(dim=-1) - length).abs() <= tolerance
+    return corrected, hit | already_ok
+
+
+def _fibonacci_sphere(n: int, device, dtype) -> torch.Tensor:
+    """`n` roughly-uniform unit vectors. Deterministic, no RNG."""
+    i = torch.arange(n, device=device, dtype=dtype) + 0.5
+    phi = torch.arccos(1.0 - 2.0 * i / n)
+    theta = math.pi * (1.0 + 5.0 ** 0.5) * i
+    return torch.stack([torch.sin(phi) * torch.cos(theta),
+                        torch.sin(phi) * torch.sin(theta),
+                        torch.cos(phi)], dim=-1)
+
+
+def solve_axis_direction_on_sphere(
+    heatmaps: torch.Tensor,      # [..., V, H, W] in [0, 1]
+    q_pos: torch.Tensor,         # [..., 3] the already-decoded position point
+    extrinsics: torch.Tensor,    # [..., V, 3, 4] camera-to-world
+    intrinsics: torch.Tensor,    # [..., V, 3, 3]
+    length: float = 0.1,
+    num_directions: int = 1024,
+    refine: bool = False,
+    refine_halfwidth: float = 0.14,
+    refine_steps: int = 17,
+) -> torch.Tensor:
+    """Recover an axis point by searching DIRECTIONS on a sphere, not depths along a ray.
+
+    ⚠️ THIS DEVIATES FROM THE PAPER. Action-Images Sec. 3.2 specifies ray marching, and says so
+    for every semantic point, not just the position:
+
+        "we cast a ray from the main-view camera center through u_hat^(1), and sample a set of
+         candidate 3D points along the ray between a near plane and a far plane. Each candidate
+         is then projected into the side view, where it is scored against the corresponding
+         side-view heatmap... In practice, this procedure is repeated for each semantic point
+         heatmap in the action image."
+
+    The paper's Discussion attributes the residual decoding error to "the sampling interval
+    along the ray" and "the spatial resolution of the heatmaps" -- i.e. to discretisation. It
+    does not mention the failure this function exists to avoid, in which the ray
+    parameterisation is not merely coarse but DEGENERATE (see below). Both solvers are kept:
+    pass `axis_solver="ray"` for the paper's method. Any number compared against the paper's
+    Table 4 (3DErr = 12.2 mm) should be produced with `axis_solver="ray"`, since that is the
+    algorithm those numbers came from.
+
+    FORK: new. The ray-marching decoder casts a ray through the axis blob's centroid in the
+    MAIN view and searches depth. That is ill-posed exactly when the axis is foreshortened in
+    that view -- the axis then projects on top of the position blob, every candidate along the
+    ray lands on the same pixels, the score is flat, and the argmax slides to whichever end of
+    the sweep it started from. Measured on a real open_drawer window this put frames 0-1 at
+    depth 0.6000 (the near plane), an axis length of 0.532 m instead of 0.100 m, and ~95 deg of
+    axis error -- the "gripper points at the sky" rollouts. Constraining the depth band helps
+    (95 -> 87 deg) but cannot fix it, because the degeneracy is in the parameterisation.
+
+    This searches the actual unknown instead. The encoder guarantees the axis point lies on the
+    sphere of radius `length` about the position point, so the only free parameter is a
+    direction: 2 DOF, bounded, and both views score it symmetrically. Foreshortening in one
+    view no longer collapses the search, because the other view still separates the candidates.
+
+    Returns the axis POINT `[..., 3]` (`q_pos + length * best_direction`).
+    """
+    *batch, V, H, W = heatmaps.shape
+    device, dtype = heatmaps.device, heatmaps.dtype
+    n = int(np.prod(batch)) if batch else 1
+    hm = heatmaps.reshape(n, V, H, W)
+    ext = extrinsics.to(device=device, dtype=dtype).reshape(n, V, 3, 4)
+    itr = intrinsics.to(device=device, dtype=dtype).reshape(n, V, 3, 3)
+    pos = q_pos.reshape(n, 3)
+
+    dirs = _fibonacci_sphere(num_directions, device, dtype)                 # (D, 3)
+    cand = pos[:, None, :] + length * dirs[None, :, :]                      # (n, D, 3)
+
+    R = ext[..., :3, :3]                                                    # (n, V, 3, 3)
+    t = ext[..., :3, 3]                                                     # (n, V, 3)
+    R_inv = R.transpose(-2, -1)
+    pts_cam = torch.einsum("nvij,nvdj->nvdi", R_inv,
+                           cand[:, None, :, :].expand(n, V, num_directions, 3) - t[:, :, None, :])
+    z = pts_cam[..., 2]
+    eps = 1e-6
+    u = itr[:, :, 0, 0][..., None] * pts_cam[..., 0] / (z + eps) + itr[:, :, 0, 2][..., None]
+    v = itr[:, :, 1, 1][..., None] * pts_cam[..., 1] / (z + eps) + itr[:, :, 1, 2][..., None]
+
+    # grid_sample expects normalised coords; align_corners=True matches the ray-marching path.
+    gx = (u / max(W - 1, 1)) * 2 - 1
+    gy = (v / max(H - 1, 1)) * 2 - 1
+    grid = torch.stack([gx, gy], dim=-1).reshape(n * V, num_directions, 1, 2)
+    scores = torch.nn.functional.grid_sample(
+        hm.reshape(n * V, 1, H, W), grid, mode="bilinear",
+        padding_mode="zeros", align_corners=True,
+    ).reshape(n, V, num_directions)
+
+    # Product across views, as the ray-marching decoder does: a candidate must be supported by
+    # EVERY view, so a point that only one camera likes cannot win.
+    agg = scores.prod(dim=1)                                                # (n, D)
+    agg = torch.where(z.min(dim=1).values > 0, agg, torch.full_like(agg, -1.0))  # in front of both
+    best = agg.argmax(dim=1)                                                # (n,)
+    d0 = dirs[best]                                                         # (n, 3)
+
+    # A uniform sphere of D points has ~sqrt(4*pi/D) rad between neighbours: 1024 directions
+    # quantise to ~6 deg, which showed up as the median axis error rising from 0.55 to 3.39 deg
+    # even while the degenerate frames were fixed. One local refinement pass removes that floor
+    # at ~1.3x the cost, instead of the 16x a globally finer sphere would need.
+    if refine:
+        # Orthonormal basis around the coarse winner.
+        tmp = torch.zeros_like(d0)
+        tmp[..., 0] = 1.0
+        alt = torch.zeros_like(d0)
+        alt[..., 1] = 1.0
+        seed = torch.where((d0[..., 0].abs() > 0.9)[..., None], alt, tmp)
+        e1 = torch.cross(d0, seed, dim=-1)
+        e1 = e1 / e1.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        e2 = torch.cross(d0, e1, dim=-1)
+        g = torch.linspace(-refine_halfwidth, refine_halfwidth, refine_steps, device=device, dtype=dtype)
+        aa, bb = torch.meshgrid(g, g, indexing="ij")
+        offs = torch.stack([aa.reshape(-1), bb.reshape(-1)], dim=-1)        # (M, 2)
+        M = offs.shape[0]
+        fine = (d0[:, None, :] + offs[None, :, 0:1] * e1[:, None, :]
+                + offs[None, :, 1:2] * e2[:, None, :])                      # (n, M, 3)
+        fine = fine / fine.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        cand_f = pos[:, None, :] + length * fine
+        pts_cam_f = torch.einsum("nvij,nvdj->nvdi", R_inv,
+                                 cand_f[:, None, :, :].expand(n, V, M, 3) - t[:, :, None, :])
+        zf = pts_cam_f[..., 2]
+        uf = itr[:, :, 0, 0][..., None] * pts_cam_f[..., 0] / (zf + eps) + itr[:, :, 0, 2][..., None]
+        vf = itr[:, :, 1, 1][..., None] * pts_cam_f[..., 1] / (zf + eps) + itr[:, :, 1, 2][..., None]
+        grid_f = torch.stack([(uf / max(W - 1, 1)) * 2 - 1,
+                              (vf / max(H - 1, 1)) * 2 - 1], dim=-1).reshape(n * V, M, 1, 2)
+        sf = torch.nn.functional.grid_sample(
+            hm.reshape(n * V, 1, H, W), grid_f, mode="bilinear",
+            padding_mode="zeros", align_corners=True).reshape(n, V, M)
+        agg_f = sf.prod(dim=1)
+        agg_f = torch.where(zf.min(dim=1).values > 0, agg_f, torch.full_like(agg_f, -1.0))
+        cand = cand_f
+        best = agg_f.argmax(dim=1)
+
+    out = cand[torch.arange(n, device=device), best]                        # (n, 3)
+    return out.reshape(*batch, 3) if batch else out.reshape(3)
+
+
+def fuse_multiview_heatmaps_to_pose_torch(
+    heatmaps_rgb: torch.Tensor,  # [..., V, H, W, 3], values in [0, 255]
+    extrinsics: torch.Tensor,  # [..., V, 3, 4]  (camera-to-world: [R|t])
+    intrinsics: torch.Tensor,  # [..., V, 3, 3]
+    near: float = 0.1,
+    far: float = 5.0,
+    num_depth_samples: int = 64,
+    edge_threshold: float = 0.01,
+    apply_edge_smoothing: bool = True,
+    gripper_mode: str = "paper",
+    strip_openness_pedestal: bool = True,
+    return_matrix: bool = False,
+    # OFF by default. The length constraint DETECTS bad frames reliably (see
+    # `return_confidence`) but does not reliably repair them: on a ground-truth open_drawer
+    # window it improved the median rotation error 0.55 -> 0.18 deg yet left the two genuinely
+    # degenerate frames at ~95 deg (their ray misses the sphere entirely, so they are left
+    # alone) and pushed two good frames from ~1.5 to ~9 deg, for a slightly worse mean
+    # (5.13 -> 5.32). Enable only if you have re-measured it on your data.
+    constrain_axis_length: Optional[float] = None,
+    axis_length_tolerance: float = 0.02,
+    return_confidence: bool = False,
+    # ON by default: this is the fix for the boundary artefact described below, it is cheap
+    # (one extra triangulation over a narrower band), and it cannot make a well-conditioned
+    # frame worse -- the true axis point is inside the band by construction.
+    constrain_axis_depth: bool = True,
+    axis_length: float = 0.1,
+    axis_depth_band: float = 1.3,
+    # "ray"    = the PAPER's method (Sec. 3.2): march depth along the main view's ray.
+    # "sphere" = a FORK DEVIATION: search the axis direction on the sphere of known radius.
+    #
+    # Sphere is the default because the ray parameterisation is not merely coarse but
+    # DEGENERATE when the axis is foreshortened in the main view -- it decodes a ~95 deg-wrong
+    # axis, i.e. an IK target the arm cannot reach. The paper does not describe that failure.
+    # ⚠️ Every reported number must state which solver produced it, and anything compared with
+    # the paper's Table 4 must use "ray". See `solve_axis_direction_on_sphere`.
+    axis_solver: str = "sphere",
+    # 16384 directions, no local refinement. Chosen on TWO criteria, because optimising only
+    # the first one produces a decoder that wiggles:
+    #
+    #   (a) worst-case axis error -- a 95 deg target is unreachable by IK, a 11 deg one is not;
+    #   (b) FRAME-TO-FRAME jitter -- an error that is independent per frame is executed by the
+    #       robot as shaking, even when its median is small. Ground truth at frame_interval 3
+    #       turns 1.70 deg between consecutive frames, so anything the decoder adds on top of
+    #       that is visible wiggle.
+    #
+    # Measured on a real open_drawer window at 256^2 (max deg / median deg / per-frame turn):
+    #   ray (upstream)   95.4 / 0.55 / 1.81   <- clean, but the "sky" failure on 2 of 41 frames
+    #   sphere  4096     10.2 / 2.82 / 4.08   <- fixes the tail, ADDS 2.4 deg/frame of wiggle
+    #   sphere  8192     12.3 / 2.72 / 2.12
+    #   sphere 16384     11.2 / 1.74 / 1.83   <- tail fixed AND jitter back to the ray level
+    #   sphere 32768     11.5 / 1.26 / 1.80   <- marginally better, 2x the cost
+    num_axis_directions: int = 16384,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+    """
+    Decode a full executable 6-DoF pose + gripper from multi-view action images.
+
+    FORK: new. This is the paper's decoder (Sec. 3.2, p. 8) implemented in full. The shipped
+    `fuse_multiview_heatmaps_to_7d_point_torch` implements only part of it -- it triangulates
+    the red and green channels and then collapses the blue channel to a boolean threshold, so
+    its output is [pos, single_axis, constant] and the roll about the forward axis is left
+    undetermined. That is not enough to command `EndEffectorPoseViaIK`/`ViaPlanning`.
+    Nothing about the REPRESENTATION is lossy: `project_actions_7d_to_5d_torch_batch` writes
+    three 3D points, i.e. two independent axes, which determine SO(3) exactly.
+
+    Encoding convention (mirror of `project_actions_7d_to_5d_torch_batch`):
+        R channel: position point           q_pos    = p
+        G channel: paper's "up" point       q_up     = p + L * R(theta) @ (+x)
+        B channel: paper's "normal" point   q_normal = p + L * R(theta) @ (-z)
+                   plus the openness pedestal in the low-response background
+    (The code's local variable names for the G/B points are swapped relative to the paper;
+    only the naming differs, the geometry is identical.)
+
+    Decoding, following the paper verbatim:
+        p_hat  = q_pos
+        e_x    = norm(q_up  - q_pos)
+        e_z    = norm(q_pos - q_normal)
+        e_y    = norm(e_z x e_x)
+        e_z'   = e_x x e_y                  # re-orthogonalize; the paper's e_x and e_z are
+                                            # only approximately perpendicular once decoded
+                                            # (measured 89.94 deg), and a valid rotation
+                                            # matrix needs them exactly so.
+        R_hat  = [e_x | e_y | e_z']         # columns
+    `e_x` is taken as the anchor because the green channel carries no openness pedestal.
+
+    Args:
+        heatmaps_rgb: [..., V, H, W, 3] in [0, 255].
+        extrinsics:   [..., V, 3, 4] camera-to-world [R|t].
+        intrinsics:   [..., V, 3, 3].
+        near, far, num_depth_samples, edge_threshold, apply_edge_smoothing:
+            Same semantics as `fuse_multiview_heatmaps_to_3d_point_torch`.
+        gripper_mode: passed to `decode_gripper_openness_torch`.
+        strip_openness_pedestal: subtract the estimated `0.25 * openness` background from the
+            blue channel before triangulating it. Without this, an OPEN frame has its whole
+            background sitting at 0.25, which drags the weighted centroid toward the image
+            center and biases the decoded axis.
+        return_matrix: also return the [..., 3, 3] rotation matrices.
+
+    Returns:
+        torch.Tensor of shape [..., 8]: [x, y, z, qx, qy, qz, qw, openness]
+        -- directly consumable as an RLBench end-effector pose action.
+        If `return_matrix`, returns `(pose_8d, rotation_matrices)`.
+    """
+    heatmaps_rgb = heatmaps_rgb.to(torch.float32)
+    pos_heatmaps = heatmaps_rgb[..., 0] / 255.0  # [..., V, H, W]
+    up_heatmaps = heatmaps_rgb[..., 1] / 255.0
+    blue = heatmaps_rgb[..., 2]  # keep in [0, 255] for the openness decoder
+
+    # 1) Gripper openness from the blue-channel pedestal (paper Eq. 7).
+    openness = decode_gripper_openness_torch(blue, mode=gripper_mode)  # [...]
+
+    # 2) Strip that pedestal so the blue channel is a clean blob before triangulation.
+    normal_heatmaps = blue / 255.0
+    if strip_openness_pedestal:
+        pedestal = (0.25 * openness).clamp(0.0, 0.25)[..., None, None, None]  # [..., 1, 1, 1]
+        normal_heatmaps = (normal_heatmaps - pedestal).clamp(min=0.0)
+
+    # 3) Triangulate all three semantic points with the same multi-view routine.
+    fuse_kwargs = dict(
+        extrinsics=extrinsics,
+        intrinsics=intrinsics,
+        near=near,
+        far=far,
+        num_depth_samples=num_depth_samples,
+        edge_threshold=edge_threshold,
+        apply_edge_smoothing=apply_edge_smoothing,
+    )
+    q_pos = fuse_multiview_heatmaps_to_3d_point_torch(pos_heatmaps, **fuse_kwargs)  # [..., 3]
+    q_up = fuse_multiview_heatmaps_to_3d_point_torch(up_heatmaps, **fuse_kwargs)  # [..., 3]
+    q_normal = fuse_multiview_heatmaps_to_3d_point_torch(normal_heatmaps, **fuse_kwargs)  # [..., 3]
+
+    # 3b) Enforce the axis length the encoder guaranteed. See `_snap_axis_point_to_length`:
+    # a free depth search can land at the wrong point along an axis ray, which leaves the
+    # heatmaps looking healthy while the recovered rotation is ~180 deg wrong.
+    conf = torch.ones(q_pos.shape[:-1], dtype=torch.bool, device=q_pos.device)
+
+    if axis_solver == "sphere" and axis_length:
+        # Search the axis DIRECTION on the sphere of known radius -- see
+        # `solve_axis_direction_on_sphere` for why the depth search cannot fix this.
+        q_up = solve_axis_direction_on_sphere(
+            up_heatmaps, q_pos, extrinsics, intrinsics, axis_length, num_axis_directions)
+        q_normal = solve_axis_direction_on_sphere(
+            normal_heatmaps, q_pos, extrinsics, intrinsics, axis_length, num_axis_directions)
+    elif constrain_axis_depth and axis_length:
+        # The encoder places both axis points at EXACTLY `axis_length` metres from the position
+        # point, so an axis point's distance from the main camera is bounded by
+        # |q_pos - camera| +/- axis_length. Searching the same global [near, far] the position
+        # used is what produces the "gripper points at the sky" failure: when the axis is
+        # foreshortened it projects on top of the position blob, a whole segment of the ray
+        # scores alike, and the argmax slides to the sweep boundary. Measured on a real
+        # open_drawer window, frames 0-1 decoded to depth 0.6000 -- exactly the near plane --
+        # giving |q_pos - q_axis| = 0.532 m instead of 0.100 m and ~95 deg of axis error.
+        # Widening the global range makes it worse (95 -> 117 -> 134 -> 159 deg as near goes
+        # 0.6 -> 0.3 -> 0.2 -> 0.1), which confirms the search is degenerate rather than the
+        # true point being out of range. Restricting each axis ray to the band around the
+        # already-decoded position removes the boundary AND samples it ~5x more finely.
+        cam0 = extrinsics[..., 0, :3, 3].to(q_pos.dtype)
+        d_pos = (q_pos - cam0).norm(dim=-1)
+        band = float(axis_length) * float(axis_depth_band)
+        lo = (d_pos - band).clamp(min=1e-3)
+        hi = d_pos + band
+        band_kwargs = dict(fuse_kwargs)
+        band_kwargs.update(near=lo, far=hi)
+        q_up = fuse_multiview_heatmaps_to_3d_point_torch(up_heatmaps, **band_kwargs)
+        q_normal = fuse_multiview_heatmaps_to_3d_point_torch(normal_heatmaps, **band_kwargs)
+
+    if return_confidence and not constrain_axis_length:
+        # Diagnostic only: flag frames whose decoded axis length is far from the encoded
+        # 0.1 m. This separates trustworthy rotations from useless ones almost perfectly --
+        # measured on ground-truth renders, flagged frames had a median axis error of 93.4 deg
+        # against 0.3 deg for the rest -- so it is worth reporting even when no correction is
+        # applied. A caller driving a robot should hold position on a flagged frame rather than
+        # command what is probably a 180 deg-wrong target.
+        for point in (q_up, q_normal):
+            gap = ((point - q_pos).norm(dim=-1) - 0.1).abs()
+            conf = conf & (gap <= axis_length_tolerance)
+    if constrain_axis_length:
+        for heat, point, name in ((up_heatmaps, q_up, "up"), (normal_heatmaps, q_normal, "normal")):
+            origin, direction = _axis_ray_from_main_view(heat, extrinsics, intrinsics)
+            fixed, ok = _snap_axis_point_to_length(
+                point, q_pos, origin, direction, constrain_axis_length, axis_length_tolerance)
+            if name == "up":
+                q_up = fixed
+            else:
+                q_normal = fixed
+            conf = conf & ok
+
+    # 4) Points -> rotation, exactly as in the paper, plus a minimal re-orthogonalization.
+    def _norm(v):
+        return v / v.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    e_x = _norm(q_up - q_pos)
+    e_z = _norm(q_pos - q_normal)
+    e_y = _norm(torch.cross(e_z, e_x, dim=-1))
+    e_z = torch.cross(e_x, e_y, dim=-1)
+    rot = torch.stack([e_x, e_y, e_z], dim=-1)  # columns are the axes
+
+    quat = rotation_matrix_to_quaternion_xyzw(rot)  # [..., 4] (x, y, z, w)
+    pose_8d = torch.cat([q_pos, quat, openness[..., None].to(q_pos.dtype)], dim=-1)
+    out = (pose_8d,)
+    if return_matrix:
+        out = out + (rot,)
+    if return_confidence:
+        out = out + (conf,)
+    return out[0] if len(out) == 1 else out
 
 
 def intrinsics_transform(intrinsics, source_size: Tuple[int, int], target_size: Tuple[int, int]):

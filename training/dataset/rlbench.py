@@ -17,6 +17,10 @@ from training.helpers.io import load_video_frames
 
 
 class RLBenchMVDataset(BaseDataset):
+    # The official HF release ships rgb + camera_params + actions only; depth/mask GT exists
+    # solely in the self-generated trees (see RLBenchSelfgenDataset).
+    AVAILABLE_MODALITIES = ("video", "action")
+
     """
     RLBench multi-view dataset implementation.
 

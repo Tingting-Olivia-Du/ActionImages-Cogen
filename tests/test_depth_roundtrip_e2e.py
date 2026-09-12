@@ -25,10 +25,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from training.dataset import RLBenchSelfgenDataset
 from training.percep.depth_codec import MAX_VALID, MIN_VALID, decode_depth
 
-SELFGEN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                       "data", "rlbench_selfgen")
+# The live tree. This used to be "rlbench_selfgen", whose symlink DANGLES (the 256 v2 tree was
+# deleted to free disk) -- so this file failed with `Found 0 episodes` on every run. RES follows
+# the tree: 512_aug renders at 512.
+SELFGEN = os.environ.get(
+    "SELFGEN_TEST_DATA",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "data", "rlbench_selfgen_512_aug"))
 N_SAMPLES = 6
-RES = 256
+RES = 512
 NUM_FRAMES = 41
 # The codec itself round-trips at ~0.07% AbsRel on this data (test_depth_codec.py), so 2% is
 # a generous ceiling that still fails hard on any wrong-view / wrong-window pairing.

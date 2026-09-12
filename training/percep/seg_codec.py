@@ -196,6 +196,188 @@ def decode_known_color(rgb: np.ndarray, color_map: dict) -> dict:
     return {name: (nearest == (i + 1)) for i, name in enumerate(names)}
 
 
+# ---- scene-role core: dense semantic roles (SEGMENTATION_SCENE_ROLES_PLAN.md §6.2) ----
+#
+# Colour binds a cross-task FUNCTIONAL ROLE, never a simulator handle and never "the Nth
+# object". Same role -> same colour in every task, episode, frame and view.
+#
+# The role<->colour assignment is NOT arbitrary. Measured pairwise sRGB distances over these 9
+# entries put the three tightest pairs at 98.3 (distractor/tool), 109.2 (fixture/unknown) and
+# 109.4 (target/tool). TAU=40 above is calibrated against the palette minimum 98.3, so whichever
+# pair sits at 98.3 is the one most likely to be confused after VAE noise. `tool` and `unknown`
+# are therefore SWAPPED relative to the plan's first draft: putting the tightest pair on
+# distractor/tool would have assigned it to two foreground classes that genuinely co-occur
+# (sweep_to_dustpan has a broom=tool next to distractors). `unknown` must never appear in valid
+# training data (§7.3 hard-fails on it), so parking it on the crowded slot costs nothing.
+SCENE_ROLES = (
+    "background",   # 0  floor / wall / table / workspace
+    "target",       # 1  the object the instruction acts on
+    "goal",         # 2  container / receptacle / destination
+    "robot_arm",    # 3  Panda links
+    "gripper",      # 4  gripper + fingers
+    "distractor",   # 5  non-target movable objects
+    "tool",         # 6  broom / stick: intermediate implements
+    "fixture",      # 7  drawer frame / grill / tap body / rack
+    "unknown",      # 8  unmapped handle -- debug only, must be absent from training data
+)
+SCENE_ROLE_PALETTE = np.array(
+    [
+        [0, 0, 0],        # background  black
+        [230, 25, 75],    # target      red
+        [60, 180, 75],    # goal        green
+        [0, 130, 200],    # robot_arm   blue
+        [70, 240, 240],   # gripper     cyan
+        [255, 225, 25],   # distractor  yellow
+        [240, 50, 230],   # tool        magenta   <- swapped with unknown, see above
+        [145, 30, 180],   # fixture     purple
+        [245, 130, 48],   # unknown     orange    <- swapped with tool, see above
+    ],
+    dtype=np.uint8,
+)
+ROLE_TO_LABEL = {r: i for i, r in enumerate(SCENE_ROLES)}
+BACKGROUND_LABEL = ROLE_TO_LABEL["background"]
+UNKNOWN_LABEL = ROLE_TO_LABEL["unknown"]
+
+# Roles that instruction resolution may assign on top of a handle's instruction-independent
+# base_role (§6.3). Only these two actually conflict; gripper/robot_arm handle sets are disjoint.
+INSTRUCTION_ROLES = ("target", "goal")
+
+# RLBench renders "no object" (the sky above the room walls) as CoppeliaSim's -1, which
+# rgb_handles_to_mask turns into 0xFFFFFF = 16777215; gen_dataset.py then stores the mask as
+# uint16, truncating it to 0xFFFF. It is not an annotation gap -- it is empty space, i.e.
+# background, and it is exactly what depth_codec already encodes as the far clip plane.
+#
+# Measured over 11200 frames of rlbench_selfgen_512_aug (scripts/audit_scene_roles.py): without
+# this entry 5.20% of ALL pixels decode as `unknown` orange, up to 52.89% in a single view, and
+# handles.json carries the "16777215": "" entry in 1005 of 1028 episodes. That violates
+# SEGMENTATION_SCENE_ROLES_PLAN.md 12.1 ("unknown must be absent from training data") on almost
+# every sample.
+#
+# Mapping it here rather than in scene_segments.json is deliberate: build_role_lut's LUT is only
+# 65536 wide, so the pre-truncation 16777215 cannot be stored as a key at all -- the sentinel
+# belongs to whoever knows about the uint16 cast, which is the codec. The largest real handle
+# observed across the tree is ~110, so 0xFFFF cannot collide with a genuine object.
+NO_OBJECT_HANDLE = 0xFFFF
+
+
+def build_role_lut(handle_to_role: dict, max_handle: int = 65536) -> np.ndarray:
+    """{handle_id: role_name} -> uint8 LUT[max_handle] mapping raw handle -> role label.
+
+    Handles absent from the mapping become UNKNOWN_LABEL rather than background: an unmapped
+    handle is an annotation gap and must stay visible (magenta-equivalent orange), not be
+    silently absorbed into the dominant class where nobody would ever notice it.
+    """
+    lut = np.full(max_handle, UNKNOWN_LABEL, dtype=np.uint8)
+    for handle, role in handle_to_role.items():
+        if role not in ROLE_TO_LABEL:
+            raise ValueError(f"unknown role {role!r} for handle {handle}; expected one of {SCENE_ROLES}")
+        h = int(handle)
+        if not 0 <= h < max_handle:
+            raise ValueError(f"handle {h} outside [0, {max_handle})")
+        lut[h] = ROLE_TO_LABEL[role]
+    # Handle 0 is CoppeliaSim's "nothing"; RLBench never renders it, but if it appears it is a
+    # background pixel, not an annotation gap. NO_OBJECT_HANDLE is the one that actually shows up
+    # (see its definition): empty space above the walls, not a missing annotation. Both are set
+    # AFTER the loop so an explicit mapping could still override them if one ever existed.
+    lut[0] = BACKGROUND_LABEL
+    lut[NO_OBJECT_HANDLE] = BACKGROUND_LABEL
+    return lut
+
+
+def encode_scene_roles(handle_map: np.ndarray, role_lut: np.ndarray) -> np.ndarray:
+    """uint16 handle map [...,H,W] + LUT from build_role_lut -> uint8 RGB [...,H,W,3].
+
+    Pure LUT indexing, no per-instance mask construction: the handle map already assigns each
+    pixel to exactly one handle, so roles cannot overlap and there is no paint order to get
+    wrong (which is exactly the failure mode encode_seg_multi's "later entries overwrite
+    earlier ones" carries).
+    """
+    labels = role_lut[handle_map.astype(np.intp)]
+    return SCENE_ROLE_PALETTE[labels]
+
+
+def scene_role_labels(handle_map: np.ndarray, role_lut: np.ndarray) -> np.ndarray:
+    """uint16 handle map -> uint8 role-label map [...,H,W] (the pre-colour intermediate)."""
+    return role_lut[handle_map.astype(np.intp)]
+
+
+def decode_scene_roles(rgb: np.ndarray, present_roles=None) -> dict:
+    """uint8 RGB [...,H,W,3] -> {role_name: bool mask [...,H,W]}.
+
+    `present_roles`: which roles this episode can legally contain. Restricting the nearest-colour
+    search to them is NOT an optimisation -- it is the same invariant decode_known_color relies
+    on ("unused reserved colors must not participate, else they can steal ambiguous pixels").
+    Which roles an episode contains is derivable from scene_segments.json + the instruction, so
+    it is available at both train and eval time; decoding against all 9 colours unconditionally
+    would widen the misclassification surface for no reason. Defaults to every role.
+
+    No connected-component pruning, small-region removal or erosion -- see the module docstring:
+    Appendix A's THETA_SIZE pruning deletes sweep_to_dustpan's dirt (5 handles of 4-8px) outright.
+    """
+    if present_roles is None:
+        present_roles = SCENE_ROLES
+    roles = list(dict.fromkeys(present_roles))  # de-dup, keep order
+    unknown = [r for r in roles if r not in ROLE_TO_LABEL]
+    if unknown:
+        raise ValueError(f"not scene roles: {unknown}; expected from {SCENE_ROLES}")
+    if "background" not in roles:
+        # Background must always compete, otherwise every black pixel is forced into some
+        # foreground role and the decode is nonsense.
+        roles = ["background"] + roles
+    colors = np.stack([SCENE_ROLE_PALETTE[ROLE_TO_LABEL[r]].astype(np.float32) for r in roles], axis=0)
+    x = rgb.astype(np.float32)
+    dists = ((x[..., None, :] - colors) ** 2).sum(-1)   # [...,H,W,K]
+    nearest = dists.argmin(-1)
+    return {role: (nearest == i) for i, role in enumerate(roles)}
+
+
+def build_scene_prompt(instruction: str, protocol: str = "rlbench-scene-role-v1") -> str:
+    """instruction -> '<scene-seg> instruction'.
+
+    Atomic on purpose. The palette is GLOBAL and fixed -- target is always red, goal always
+    green, robot_arm always blue, in every task, episode, frame and view -- so the colour map is
+    learned from the data and never needs stating. The repo's own rule (see `seg_tag`) is to
+    parameterise a tag only when the mapping cannot be inferred; a constant string carries zero
+    bits and cost 12 UMT5 tokens on every seg sample.
+
+    The dropped `protocol=rlbench-scene-role-v1` also created false confidence: `scene_segments.json`
+    already records the protocol, and the version was NOT bumped when the targets changed
+    (2026-08-23, the NO_OBJECT_HANDLE and handle-union fixes), so two checkpoints trained on
+    different targets both claimed "v1". If a second dense-segmentation protocol ever ships, give
+    it its OWN atomic tag -- the way `depth` and `normal` each have one -- rather than a version
+    parameter the model cannot act on.
+
+    The tag must still differ from `<seg:`: the two protocols produce different images from the
+    same instruction. It must also be scrub-invariant (no `_`, no `.`) -- see the module docstring
+    of training/templates.py:scene_seg_tag's predecessor and train.py:287.
+
+    `protocol` is accepted and ignored, so existing callers keep working.
+    """
+    return f"<scene-seg> {instruction}"
+
+
+def scene_role_iou(pred_masks: dict, gt_labels: np.ndarray, roles=None) -> dict:
+    """{role: bool mask} + uint8 GT label map -> {role: IoU}.
+
+    Roles absent from BOTH prediction and GT get IoU 1.0 (vacuously correct); absent from GT but
+    predicted gets 0.0. Callers aggregating a macro mIoU should drop the vacuous entries rather
+    than let them inflate the mean -- `gt_px` is returned alongside so they can.
+    """
+    roles = list(roles or pred_masks)
+    out = {}
+    for role in roles:
+        gt = gt_labels == ROLE_TO_LABEL[role]
+        pd = pred_masks.get(role, np.zeros_like(gt))
+        inter = int((pd & gt).sum())
+        union = int((pd | gt).sum())
+        out[role] = {
+            "iou": (float(inter) / float(union)) if union else 1.0,
+            "gt_px": int(gt.sum()),
+            "pred_px": int(pd.sum()),
+        }
+    return out
+
+
 def build_referring_spec(seg_targets: dict, instruction: str) -> tuple:
     """seg_targets.json content (plan §2.1) + instruction text -> ({name: [handle_ids]}, prompt
     color_map {name: color_name}, dropped_groups). Starts from the default "referring" groups,
