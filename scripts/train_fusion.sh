@@ -99,6 +99,7 @@ esac
 # table (segloss_pos/*) comparable across steps.
 ACTION_DROPOUT="${ACTION_DROPOUT:-0.0}"
 
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 # Required: an editable install of a distribution ALSO named "actionimages" maps `training`
@@ -171,6 +172,18 @@ SEG_SUFFIX=""
 FMM_SUFFIX="_$(printf '%s' "$FUSION_MASK_MIX" | tr -c '[:alnum:]' '-')"
 OUT="${OUT:-$REPO/outputs/${SLUG}_seed${SEED}${FI_SUFFIX}${DS_SUFFIX}${SEG_SUFFIX}${FMM_SUFFIX}}"
 NPROC=$(echo "$GPUS" | tr ',' '\n' | grep -c .)
+# Global batch must stay 4 no matter how many cards the scheduler hands out, because batch is part
+# of the recipe: steps 1-5000 of this arm ran at 4. On a cluster where 4 GPUs on one node is a
+# rare allocation, accumulation is what decouples the recipe from the allocation.
+#   4 GPUs -> accum 1      2 GPUs -> accum 2      1 GPU -> accum 4
+# Derived rather than passed so the two cannot disagree; override GRAD_ACCUM only to break the
+# invariant on purpose, and say so in the run name if you do.
+GRAD_ACCUM="${GRAD_ACCUM:-$(( 4 / NPROC ))}"
+if [ $(( GRAD_ACCUM * NPROC )) -ne 4 ]; then
+  echo "!! global batch = GRAD_ACCUM($GRAD_ACCUM) x NPROC($NPROC) = $(( GRAD_ACCUM * NPROC )), not 4."
+  echo "   steps 1-5000 of this arm ran at 4; a different batch is a different recipe."
+  echo "   Set GRAD_ACCUM explicitly if that is intended."
+fi
 
 INIT_CKPT="${INIT_CKPT-/workspace/ttdu/starVLA/playground/Pretrained_models/anyeZHY/ActionImages/step125750.ckpt}"
 # 5000 warm-start (= arm7u@10000's exposure at batch 4; see header) vs the 125k order of
@@ -209,7 +222,7 @@ SEGS=$(( $(printf '%s' "${MIX%%@*}" | tr '+' '\n' | grep -c .) * 2 ))
 echo "arm=$ARM mix='$MIX' -> ${SEGS} segments"
 echo "seg_mode=$SEG_MODE fusion_mask_mix=$FUSION_MASK_MIX action_dropout=$ACTION_DROPOUT"
 echo "dataset=$DATASET GPUS=$GPUS NPROC=$NPROC SEED=$SEED STEPS=$STEPS RES=$RES PORT=$PORT"
-echo "global batch = NPROC x 1 = ${NPROC}; ${STEPS} steps = $(( STEPS * NPROC )) samples"
+echo "global batch = NPROC($NPROC) x per_device(1) x accum($GRAD_ACCUM) = $(( NPROC * GRAD_ACCUM )); ${STEPS} steps = $(( STEPS * NPROC * GRAD_ACCUM )) samples"
 echo "OUT=$OUT"
 # Report what the weights ACTUALLY come from: train.py prefers a checkpoint found in output_dir
 # over init_ckpt_path, so printing INIT_CKPT unconditionally reads as "warm-starting" even when
@@ -246,7 +259,7 @@ CUDA_VISIBLE_DEVICES=$GPUS torchrun --nnodes=1 --nproc_per_node=$NPROC --master_
   --model_id Wan-AI/Wan2.2-TI2V-5B \
   --max_steps "$STEPS" --num_train_epochs 1 --steps_per_epoch "$STEPS" \
   --learning_rate 5e-7 --warmup_steps 1000 --lr_scheduler_type constant_with_warmup \
-  --gradient_accumulation_steps 1 --max_grad_norm 1.0 \
+  --gradient_accumulation_steps "$GRAD_ACCUM" --max_grad_norm 1.0 \
   --use_gradient_checkpointing \
   --dataloader_num_workers 4 --dataloader_prefetch_factor 2 --dataloader_pin_memory True \
   --checkpoint_every_n_steps "$CKPT_EVERY" --checkpoint_save_top_k "$SAVE_TOP_K" \

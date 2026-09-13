@@ -58,6 +58,72 @@ the text only as a direction indicator, never as a headline.
 External reference points, from `ARM7_RESULTS.md` at step 10000 (different arm, 4-segment):
 arm7 depth AbsRel 0.1315, normal cos 0.8805; depth specialist 0.2267, normal specialist 0.3699.
 
+## Training-time diagnostics, scaled-tree arm, 5,000 steps — MEASURED, and well powered
+
+Extracted from the run's own W&B transaction log (`wandb/run-20260909_034125-11gts31i/*.wandb`,
+parsed via `wandb.sdk.internal.datastore`; keys arrive under `nested_key`, not `key`). These need
+no GPU and are averaged over thousands of steps, so they carry far more power than the n=1
+offline grid above. **They reverse the step-2000 single-episode read.**
+
+Realised F1 schedule over 5,001 steps — note the denominator: `segloss_pos/0` is logged only when
+segment 0 has a predicted position, which excludes `rgb_given` (video fully given) and `policy`
+(video collapsed to its anchor), i.e. 25.5% of steps. Using it as the denominator inflates every
+share by 1/0.745.
+
+| regime | realised | declared |
+|---|---|---|
+| full_anchor | 0.299 | 0.30 |
+| rgb_only | 0.301 | 0.30 |
+| rgb_given | 0.157 | 0.15 |
+| one_out | 0.145 | 0.15 |
+| policy | 0.098 | 0.10 |
+
+**`absent / anchored` loss ratio, full-run means** (n = 2,000–3,000 steps per cell):
+
+| modality | anchored | absent | ratio |
+|---|---|---|---|
+| video | 1.7383 | 2.5859 | 1.488 |
+| depth | 0.7206 | 1.0141 | 1.407 |
+| segmentation | 0.7646 | 0.8984 | 1.175 |
+| normal | 1.2789 | 2.2867 | 1.788 |
+| **action** | 0.2978 | 0.2816 | **0.945** |
+
+Action's ratio is **below 1**: it is no harder to produce without its own anchor, which is direct
+evidence that the co-present observations carry what action needs.
+
+**Trend, first 1,000 steps → last 1,000** (falling = learning to generate without an anchor):
+
+| modality | early | late | Δ |
+|---|---|---|---|
+| depth | 1.776 | 1.266 | **−0.510** |
+| action | 1.374 | 0.860 | **−0.513** |
+| segmentation | 1.390 | 1.097 | −0.293 |
+| video | 1.635 | 1.409 | −0.226 |
+| **normal** | 1.705 | **1.855** | **+0.150** |
+
+Four of five improve. **`normal` is the exception and gets worse** — notable because it is
+analytically a function of depth, so the model is evidently not learning that constraint.
+
+**Rotary-position extrapolation: ruled out.** Same-modality loss, view 0 (positions 0–43) → view 1
+(55–109): video −0.0228, depth +0.0165, segmentation +0.0052, normal +0.0062, action +0.0052 —
+i.e. 0.3–1.9%, one of them negative. Systematic position degradation would be uniform and large.
+
+**Peak memory, allocator high-water:** mean 36.29 GB, max 36.64 GB over 5,000 steps at four ranks.
+(`nvidia-smi` read 38.8 GB; the difference is CUDA context.)
+
+**Learning rate `5e-7` is conservative, not too high** (from the trainer log, 500 records):
+
+| phase | lr | grad_norm med | p90 | max | loss med |
+|---|---|---|---|---|---|
+| 0–10% (warmup) | 5e-9 → | 0.716 | 2.640 | 6.567 | 0.0801 |
+| 10–20% | 2.55e-7 | 0.339 | 0.731 | 0.866 | 0.0577 |
+| 20–50% | 5e-7 | 0.295 | 0.522 | 3.085 | 0.0483 |
+| 50–80% | 5e-7 | 0.288 | 0.611 | 1.811 | 0.0445 |
+| 80–100% | 5e-7 | 0.269 | 0.504 | 0.821 | 0.0423 |
+
+grad_norm falls monotonically; only 5.0% of steps touch the 1.0 clip and those concentrate in
+warmup; loss still descending at the end. Under-trained, not unstable.
+
 ## PENDING — must stay a placeholder in the .tex until measured
 
 | Quantity | Status |
@@ -68,4 +134,4 @@ arm7 depth AbsRel 0.1315, normal cos 0.8805; depth specialist 0.2267, normal spe
 | F0 all-anchor control arm (`fusion0-anchor`) | not trained |
 | Held-out (variation 1/2) numbers for any fusion arm | not run |
 | Multi-episode / multi-seed CIs for any fusion number | not run |
-| RoPE-extrapolation read from `segloss_pos/<k>` | logged to wandb; not yet extracted |
+| ~~RoPE-extrapolation read~~ | **DONE — extracted, extrapolation ruled out (see above)** |
