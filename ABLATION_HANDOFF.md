@@ -246,6 +246,8 @@ what is wrong.
 
 One arm at a time per 4-GPU group. Identical everything except the arm name:
 
+here is what my previous machine do, but you can adapt to your machine, just keep global batch size same and comparable.
+
 ```bash
 cd <repo>
 GPUS=0,1,2,3 \
