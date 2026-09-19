@@ -75,6 +75,7 @@ target-only mask). This is likewise part of the arm definition, not a preference
 
 ## 3. Machine and container
 
+The old setting is for your reference, adapt to your local machine
 The origin machine is a **Docker container** (`/.dockerenv` present) on:
 
 - Ubuntu 20.04.6, CUDA 12.1 toolkit, driver **610.43.02**
