@@ -89,7 +89,7 @@ Environment (`requirements.txt` is the source of truth; the pinned versions actu
 
 ```
 torch 2.6.0+cu124   transformers 4.57.3   diffsynth 1.1.9
-deepspeed 0.16.9    accelerate 1.5.2      wandb 0.28.1
+deepspeed 0.16.9    accelerate 1.5.2      
 ```
 
 ```bash
@@ -120,7 +120,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 RUN pip install --no-cache-dir transformers==4.57.3 deepspeed==0.16.9 diffsynth==1.1.9 \
         accelerate safetensors einops imageio imageio-ffmpeg opencv-python-headless \
-        pillow scikit-image lpips wandb numpy scipy
+        pillow scikit-image lpips numpy scipy
 ```
 
 `libgl1`, `libglib2.0-0` and `ffmpeg` are needed: the loader decodes `.mp4` per episode, and
@@ -143,10 +143,7 @@ an overflow that will not clear, the origin repo's history contains
 `chtc/patch_deepspeed_bf16_overflow.py` (removed in this cleanup) — ask before reintroducing it,
 since none of the 6k runs so far have needed it.
 
-**W&B**: `train_arm.sh` refuses to start without a key, because `wandb.init()` runs *after* the
-12.8 GB checkpoint has loaded and a missing key would waste that load. Either export
-`WANDB_API_KEY`, or point `TTD_ENV` at a file containing `WANDB_API=...`, or pass
-`EXTRA_ARGS='--report_to none'`.
+**W&B**: new update: no wandb needed, delete wandb relavant part.
 
 ---
 
