@@ -99,7 +99,49 @@ pip install -r requirements.txt
 pip install -e .            # the distribution MUST be named "actionimages"; train.py asserts on it
 ```
 
-`flash-attn` is commented out in `requirements.txt` on purpose — it is not required.
+**Do not install `flash-attn`.** The start-up line `Flash Attention library "flash_attn" not
+found, using pytorch attention implementation` reads as a warning and is not one: measured on
+the origin host, `torch.ops.aten._fused_sdp_choice` returns backend 1 (FlashAttention) for this
+model's `[1, 24, 28160, 128]` bf16 attention — 54.9 ms, against 88.1 ms for the memory-efficient
+path. Torch's own SDPA already dispatches to Flash for this shape. The external package buys
+nothing and costs a very long build. It is commented out in `requirements.txt` for this reason.
+
+### 3.1 Container
+
+The origin host runs bare in a container rather than from an image built for this project, but
+a reproducible image is four lines. The pins below are transcribed from the host, not chosen:
+
+```dockerfile
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates build-essential libgl1 libglib2.0-0 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+# python 3.10.20, then:
+RUN pip install --no-cache-dir torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+RUN pip install --no-cache-dir transformers==4.57.3 deepspeed==0.16.9 diffsynth==1.1.9 \
+        accelerate safetensors einops imageio imageio-ffmpeg opencv-python-headless \
+        pillow scikit-image lpips wandb numpy scipy
+```
+
+`libgl1`, `libglib2.0-0` and `ffmpeg` are needed: the loader decodes `.mp4` per episode, and
+OpenCV pulls the GL libraries even in the headless build.
+
+Run it with `--gpus '"device=0,1,2,3"' --ipc=host --shm-size=32g`. The dataloader uses 4 workers
+per rank with pinned memory, and the default 64 MB `/dev/shm` will deadlock it.
+
+Mount the data and the weights rather than baking them in — they are ~200 GB together:
+
+```bash
+docker run --rm -it --gpus '"device=0,1,2,3"' --ipc=host --shm-size=32g \
+    -v /host/data:/app/data -v /host/checkpoints:/app/checkpoints \
+    -v /host/outputs:/app/outputs -e WANDB_API_KEY \
+    <image> bash scripts/train_arm.sh arm1
+```
+
+One known patch: DeepSpeed's bf16 path does not skip non-finite gradients upstream. If you hit
+an overflow that will not clear, the origin repo's history contains
+`chtc/patch_deepspeed_bf16_overflow.py` (removed in this cleanup) — ask before reintroducing it,
+since none of the 6k runs so far have needed it.
 
 **W&B**: `train_arm.sh` refuses to start without a key, because `wandb.init()` runs *after* the
 12.8 GB checkpoint has loaded and a missing key would waste that load. Either export
