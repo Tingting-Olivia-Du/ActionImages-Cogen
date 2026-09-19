@@ -210,6 +210,69 @@ TASK_ROLES = {
         "tap_main_visual": "fixture",
         "tap_left_visual": "distractor", "tap_right_visual": "distractor",
     },
+    # ---- unseen-task EVAL additions (2026-09-17, three-tier eval restructure) ----------------
+    # Handles harvested from a 1-seed generation per task (exact-name matching, like every
+    # entry above); the tree-level handle union + zero-unknown gate catches anything the
+    # 3-frame sample missed. Tier A = inverse counterpart of a trained task; tier B = same
+    # skill family, new object; tier C = new skill family. See plan/maniskill3_handoff.md §H2.
+    "meat_on_grill": {
+        # Tier A mirror of meat_off_grill. There the grill is what the meat LEAVES (fixture);
+        # here it is the destination, so `goal` -- the open_drawer/put_item_in_drawer precedent
+        # that geometry does not determine role, the task does.
+        "grill_visual": "goal",
+        "chicken_visual": "distractor", "steak_visual": "distractor",
+    },
+    "light_bulb_out": {
+        # Tier A mirror of light_bulb_in; this scene uses singular names (no 0/1 variants).
+        # The holder is the source the bulb leaves -- take_lid_off_saucepan precedent:
+        # source container = goal.
+        "bulb": "goal",
+        "light_bulb": "distractor",
+    },
+    "take_item_out_of_drawer": {
+        # Tier A mirror of put_item_in_drawer, and the same container reading: the boxes are
+        # where the item comes FROM (goal), not open_drawer's manipulanda -- the instruction's
+        # object is the ITEM.
+        "drawer_frame": "fixture", "drawer_legs": "fixture",
+        "drawer_top": "goal", "drawer_middle": "goal", "drawer_bottom": "goal",
+        "item": "distractor",
+    },
+    "take_money_out_safe": {
+        # Tier A mirror of put_money_in_safe (safe_body goal / safe_door fixture unchanged).
+        # This scene instantiates three indexed stacks plus front/back sheet visuals; index 0
+        # of the front sheets did not surface in the 3-frame harvest but unused LUT slots are
+        # free (see task_handle_union docstring), so all three are listed.
+        "safe_body": "goal", "safe_door": "fixture",
+        **{f"dollar_stack{i}": "distractor" for i in range(3)},
+        **{f"dollar_back_visual{i}": "distractor" for i in range(3)},
+        **{f"dollar_front_visual{i}": "distractor" for i in range(3)},
+        "money_boundary": "background",  # helper plane, same class as dollar_stack_boundary
+    },
+    "put_rubbish_in_bin": {
+        # Tier B place-into-container with REAL distractors: the tomatoes stay on the table,
+        # and only the instruction-referred rubbish would be promoted to target.
+        "bin_visual": "goal",
+        "rubbish_visual": "distractor",
+        "tomato1_visual": "distractor", "tomato2_visual": "distractor",
+    },
+    "stack_cups": {
+        # Tier B counterpart of stack_blocks/stack_wine. All cups are candidates; note the
+        # instruction NAMES the base cup (the destination), so on trees without seg_targets
+        # the roles stay base_role=distractor for all three -- do not hand one of them `goal`,
+        # which cup is the base is an episode-random variable.
+        "cup1_visual": "distractor", "cup2_visual": "distractor", "cup3_visual": "distractor",
+    },
+    "open_window": {
+        # Tier C articulated-open on a new mechanism (casement). close_microwave precedent:
+        # hinged part = manipulandum, carcass = fixture.
+        "window_left": "distractor",
+        "left_frame_visual": "fixture", "right_frame_visual": "fixture",
+        "window_main_visual": "fixture", "window_wall0": "fixture",
+    },
+    "wipe_desk": {
+        # Tier C surface-contact family. sweep_to_dustpan precedent: the implement is `tool`.
+        "sponge_visual": "tool",
+    },
 }
 
 

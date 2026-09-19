@@ -637,6 +637,24 @@ class ActionImagesTrainer(Trainer):
             return
         return super().save_model(output_dir=output_dir, _internal_call=_internal_call)
 
+    def _save_optimizer_and_scheduler(self, output_dir):
+        """Optionally skip DeepSpeed's global_step*/ (the 120GB half of a checkpoint).
+
+        With ZeRO-2 on 5B params this writes fp32 master weights + Adam m/v + grads, and
+        `keep_optimizer_last_only` can only delete the PREVIOUS tip AFTER the new one is
+        written -- so a save transiently needs ~240GB free. On 2026-09-17 both joint runs
+        hit that ceiling: arm7 died mid-write at step 2000 leaving truncated shards (5-6GB
+        instead of 19.2GB) and no stepN.ckpt.
+
+        With --save_optimizer_state False only the 12GB stepN.ckpt (plus trainer_state.json,
+        written by the caller) survives, so a checkpoint cannot fill the volume. The cost is
+        that resume is weights-only: Adam moments restart and the step counter restarts with
+        --allow_step_restart.
+        """
+        if not getattr(self.args, "save_optimizer_state", True):
+            return
+        return super()._save_optimizer_and_scheduler(output_dir)
+
     def _save_checkpoint(self, model, trial, metrics=None):
         """Custom checkpoint saving to save only trainable parameters"""
         # Call parent method for other checkpoint data

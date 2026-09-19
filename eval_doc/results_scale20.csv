@@ -1,0 +1,6 @@
+model,status,basketball_in_hoop_success,close_box_success,close_drawer_success,close_microwave_success,take_lid_off_saucepan_success,toilet_seat_down_success,basketball_in_hoop_n,close_box_n,close_drawer_n,close_microwave_n,take_lid_off_saucepan_n,toilet_seat_down_n,total_success,total_n,total_pct
+official (step125750),complete,0,5,16,15,16,3,20,20,20,20,20,20,55,120,45.8
+specialist_action (step4000),complete,0,6,15,16,18,4,20,20,20,20,20,20,59,120,49.2
+arm6 (step10000),complete,0,9,7,17,15,5,20,20,20,20,20,20,53,120,44.2
+arm7 (step10000),complete,0,16,13,14,0,4,20,20,20,20,20,20,47,120,39.2
+fusion0 (step8000),complete,0,6,4,4,3,8,20,20,20,20,20,20,25,120,20.8

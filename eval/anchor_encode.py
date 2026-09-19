@@ -41,6 +41,14 @@ ANCHOR_TEMPLATE = {
     # never trains on a 4-segment canvas, so a bad number there would measure the format
     # mismatch, not the policy.
     "fusion": "video+depth+segmentation+normal+action",
+    # Same 10-segment canvas, but asked under `full_anchor`: every modality gets its OWN real
+    # anchor frame (rendered live from the simulator's ground truth), not just video. This is
+    # off-deployment -- a real robot cannot supply a depth/segmentation/normal frame -- but it
+    # answers a different question than `fusion` does: is closed-loop failure an action-
+    # prediction problem, or a conditioning-starvation problem that rgb_only creates. See
+    # HANDOFF_EVAL.md's four offline regimes; this extends `full_anchor` to closed loop, which
+    # previously only had it offline.
+    "fusion_full_anchor": "video+depth+segmentation+normal+action",
 }
 
 # Which conditioning each anchor is asked under. The 4-segment entries keep i2va (first frame of
@@ -48,6 +56,7 @@ ANCHOR_TEMPLATE = {
 ANCHOR_CONDITIONING = {
     "video": None, "depth": None, "segmentation": None, "normal": None,
     "fusion": "rgb_only",
+    "fusion_full_anchor": "full_anchor",
 }
 
 

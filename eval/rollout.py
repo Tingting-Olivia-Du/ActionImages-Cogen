@@ -198,12 +198,20 @@ def rollout_one(
         from training.templates import parse_template, prompt_prefix
         # tag 必须跟着锚定模态走:`<depth><action> ` / `<scene-seg><action> ` / `<normal><action> `。
         # 用错 tag 就是在问 checkpoint 一个它没被训过的组合(prompt scrub trap 的同类)。
-        if getattr(env, "anchor_modality", "video") == "all":
-            # 融合模式:每条路径一份 prompt,tag 各自对应自己的模态。
+        if getattr(policy, "full_anchor_fusion", False):
+            # 10 段融合画布,单份 prompt(跟画布本身的 template 走),不是四路独立 prompt。
+            _tpl = policy.template
+            prompt = prompt_prefix(parse_template(_tpl), style=prompt_tag_style,
+                                   segmentation_mode="scene_roles") + str(descriptions[0])
+        elif getattr(env, "anchor_modality", "video") == "all":
+            # 老的四路独立融合模式:每条路径一份 prompt,tag 各自对应自己的模态。只取四个
+            # 单模态条目 -- ANCHOR_TEMPLATE 还收了 fusion/fusion_full_anchor 两个 10 段条目,
+            # 混进来会问四路里多出两条它们不认的模板。
             from eval.anchor_encode import ANCHOR_TEMPLATE
-            prompt = {m: prompt_prefix(parse_template(t), style=prompt_tag_style,
+            base_modalities = ("video", "depth", "segmentation", "normal")
+            prompt = {m: prompt_prefix(parse_template(ANCHOR_TEMPLATE[m]), style=prompt_tag_style,
                                        segmentation_mode="scene_roles") + str(descriptions[0])
-                      for m, t in ANCHOR_TEMPLATE.items()}
+                      for m in base_modalities}
         else:
             _tpl = getattr(policy, "template", "video+action")
             prompt = prompt_prefix(parse_template(_tpl), style=prompt_tag_style,
@@ -262,7 +270,10 @@ def rollout_one(
             if step % steps_per_chunk == 0:
                 # The current pose is conditioning, not prediction -- see policy.run_policy.
                 _av = _anchor_views(env, obs, intr, task, seg_lut)
-                if isinstance(_av, dict):
+                if getattr(policy, "full_anchor_fusion", False):
+                    chunk = policy.run_policy_full_anchor(_av, extr, intr, prompt,
+                                                          current_pose8=env.current_pose8(obs))
+                elif isinstance(_av, dict):
                     chunk = policy.run_policy_fused(_av, extr, intr, prompt,
                                                     current_pose8=env.current_pose8(obs))
                 else:
@@ -406,9 +417,16 @@ def main():
                          "encoded 0.1 m (median rotation error ~93 deg on those) instead of "
                          "commanding them; a debug lever for the high ik_fail rate")
     ap.add_argument("--anchor-modality", default="video",
-                    choices=("video", "depth", "segmentation", "normal", "all"),
+                    choices=("video", "depth", "segmentation", "normal", "all", "fusion",
+                             "fusion_full_anchor"),
                     help="策略以哪种观测为锚定帧。video = 历史行为(仿真器只渲染 RGB);"
-                         "其余三个会打开对应的额外渲染,每步都要多花仿真时间。")
+                         "depth/segmentation/normal 会打开对应的额外渲染,每步都要多花仿真"
+                         "时间;fusion = 10 段融合画布,rollout 仍只观测 RGB(rgb_only),"
+                         "只是 ActionImagePolicy 用完整模板问模型,RolloutEnv 端等同 video;"
+                         "fusion_full_anchor = 同一 10 段画布,但每个模态都喂真锚定帧"
+                         "(simulator 现场渲染 depth/mask,RolloutEnv 端等同 all)——"
+                         "离线 full_anchor 上限搬到闭环,答的是「rgb_only 本身是不是瓶颈」"
+                         "而不是「四路独立问再融合」(那是 all 模式)。")
     # 默认【开】。2026-09-07 改:非 RGB 锚定的三次闭环因为漏了这个 flag,300 个 rollout
     # 全部没有留下视频,而重跑要 ~33 GPU-小时。录像的边际成本很小(一次 100-rollout 的
     # campaign 约 330 MB),而缺了它就只剩一个成功率标量,失败模式无从判读。
@@ -482,9 +500,24 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     out_path = os.path.join(args.out, f"rollout_{args.tag}.json")
 
+    # RolloutEnv only knows the four RENDER-side anchors (video/depth/segmentation/normal) plus
+    # the old "all" ensemble; it has no notion of the 10-segment fusion canvas. Under fusion the
+    # rollout still OBSERVES nothing but RGB (rgb_only is the deployment condition -- see
+    # ANCHOR_CONDITIONING["fusion"]), so the env gets "video" while ActionImagePolicy keeps
+    # "fusion" to pick the full template/conditioning. Same split ActionImagePolicy.__init__
+    # already does internally for its own `self.anchor_modality`. fusion_full_anchor needs the
+    # SAME live depth/mask rendering the old "all" ensemble needs (real anchors for every
+    # modality), so it maps to "all" at the env level -- only the POLICY-side consumption
+    # differs (one 10-segment forward pass vs. four independent 4-segment queries).
+    if args.anchor_modality == "fusion":
+        env_anchor_modality = "video"
+    elif args.anchor_modality == "fusion_full_anchor":
+        env_anchor_modality = "all"
+    else:
+        env_anchor_modality = args.anchor_modality
     with RolloutEnv(resolution=args.res, headless=True,
                     arm_action_mode=args.arm_action_mode,
-                    anchor_modality=args.anchor_modality) as env:
+                    anchor_modality=env_anchor_modality) as env:
         print(f"env up; tasks={args.tasks} trials={args.num_trials} "
               f"execution_horizon={args.execution_horizon} arm={args.arm_action_mode} "
               f"gt_replay={args.gt_replay}", flush=True)

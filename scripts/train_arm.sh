@@ -1,134 +1,53 @@
 #!/bin/bash
-# ============================================================================
-# One experimental arm of the perception/action co-generation study.
-# ----------------------------------------------------------------------------
-# An arm is defined by ONE thing: --template_mix. Everything else -- data tree, seed, steps,
-# lr, warm-start checkpoint, prompt tag style -- is identical across arms, so any difference
-# in r_peak is attributable to the task menu and nothing else.
-#
-#   bash scripts/train_arm.sh arm0     # video+action@1.0                      the CONTROL
-#   bash scripts/train_arm.sh arm1     # 60% action / 20% depth / 20% seg      low-ratio perception
-#   bash scripts/train_arm.sh arm2     # 50% action / 50% co-generation        co-supervision
-#   bash scripts/train_arm.sh "video+depth@1.0"      # any explicit mix also works
-#   bash scripts/train_arm.sh arm4     # 60% action / 40% depth
-#   bash scripts/train_arm.sh arm5     # 60% action / 40% surface normal
-#   bash scripts/train_arm.sh arm6     # 40% action / 20% each depth+seg+normal (4 streams)
-#   bash scripts/train_arm.sh arm7     # action in EVERY template, observation in 4 modalities
-# WHY Arm-0 IS NOT OPTIONAL. The variation0 train split is only ~470 episodes, and a pure
-# action run on it has previously gone r_peak 500步=98.5 -> 2500步=47.0 -> 3000步=3.7 while
-# the loss curve looked fine (ttd plan/core/TODO_post_3k_overfit.md). Without a same-recipe
-# no-perception arm there is nothing to attribute an r_peak change to: continued-training
-# drift and perception interference are indistinguishable. A zero-shot reading of the official
-# checkpoint does NOT serve this role -- it measures a different thing (how strong the prior
-# is), not where the prior drifts to on this data.
-#
-# INITIALISATION: stage 1 warm-starts from anyeZHY's step125750, because the main research
-# question is "does adding perception damage an ALREADY-TRAINED action prior". Pass
-# INIT_CKPT= (empty) for the stage-2 from-Wan-base run, which answers a different question
-# ("which modality is easier to learn") and costs ~21 days/arm at 125k steps -- do not start
-# that until the code is frozen and stage 1 has a result.
-#
-# DATA TREE: selected with DATASET=, and it is NOT a free knob -- it changes what the arm is
-# comparable to. Arms may only be compared within one tree.
-#
-#   rlbench_selfgen_512_aug  (default) 512x512, Colosseum-style domain randomisation: camera
-#                            pose, table colour/texture, background texture, light colour.
-#                            1028 episodes / 788 at variation0. The only self-gen tree whose
-#                            visual diversity approaches the official release.
-#   rlbench_selfgen          256x256, the v2 tree arm0/arm1 were trained on. Background wall
-#                            only -- fixed cameras, fixed table, fixed lighting.
-#   rlbench_selfgen_512      512x512 un-augmented. DELETED to free disk; the symlink dangles.
-#
-# RESOLUTION follows the tree and is derived below, because training at anything other than the
-# rendered resolution is silently wasteful in one direction (256 tree at 512 upsamples for ~4x
-# the attention cost and zero extra information) and lossy in the other. Override with RES= only
-# to test that claim. NOTE the official checkpoint was trained at 512, so a 256 arm pays a
-# 512-prior -> 256-domain adaptation that a 512 arm does not: absolute r_peak is not comparable
-# across trees, which is why the tree is stamped into OUT and the run name.
-#
-# TEMPORAL SPAN: FRAME_INTERVAL controls how much MOTION a 41-frame window covers, which
-# --num_frames alone does not. The selfgen tree is written at native 20 Hz 1:1, so the default
-# FRAME_INTERVAL=1 gives 2.0 s per window; the official release is effectively 4 (its video is
-# stored 4x-downsampled, actions realigned with actions[::4]) and covers 8.0 s. arm0/arm1 were
-# trained at 1 -- do not change it on those. A different interval writes to a different OUT
-# (suffix _fi<N>) so it cannot silently resume an arm trained at another rate.
-# no, this is not right
-#   FRAME_INTERVAL=3 bash scripts/train_arm.sh arm0   # 6.0 s windows at 6.7 Hz
-#
-# Env overrides:  DATASET, GPUS, SEED, STEPS, RES, OUT, PORT, INIT_CKPT, VARIATIONS,
-#                 FRAME_INTERVAL, SEG_MODE, PERCEPTION_MASK_MIX, ACTION_MASK_MIX, CKPT_EVERY,
-#                 SAVE_TOP_K, DS_CONFIG, EXTRA_ARGS
-# Resume: re-run the same command; find_latest_checkpoint picks up output_dir's newest ckpt.
-#         A FRESH arm therefore needs an empty output_dir, or the warm-start is silently
-#         replaced by that directory's latest checkpoint (train.py:490).
-# ============================================================================
 set -uo pipefail
 source /opt/conda/etc/profile.d/conda.sh
 conda activate ttd_train
 
-ARM="${1:?usage: train_arm.sh <arm0|arm1|arm2|template_mix>}"
+ARM="${1:?usage: train_arm.sh <arm0..arm8|template_mix>   (plan: ACTION_MASK_MIX=A0|A1|A2)}"
+# Each case sets MIX, and may declare the two things that are part of the arm's DEFINITION
+# rather than a preference: which segmentation protocol it means, and which conditioning plan
+# it is canonically trained under. Both are overridable per run (SEG_MODE=, ACTION_MASK_MIX=)
+# and both reach the output path, so an override cannot silently resume the other variant.
+# `*)` must stay LAST -- it matches everything, and any branch written after it is dead.
 case "$ARM" in
-  arm0) MIX="video+action@1.0" ;;
-  # SEG_MODE_DEFAULT is part of the arm DEFINITION, not a preference: `referring` (a target-only
-  # mask, median 0.18% non-black) and `scene_roles` (a dense role map, 11.8%) are different
-  # supervision signals that happen to share a modality name. An arm that does not record which
-  # one it meant is not reproducible. Override for one run with SEG_MODE=.
-  arm1) MIX="video+action@0.6,video+depth@0.2,video+segmentation@0.2"; SEG_MODE_DEFAULT=scene_roles ;;
-  arm2) MIX="video+action@0.5,video+depth+action@0.5" ;;
-  arm4) MIX="video+action@0.6,video+depth@0.4" ;;
-  # arm5 mirrors arm4 with normal in depth's place, so the pair isolates one modality swap at a
-  # fixed action ratio. NOTE outputs/arm4__seed42_fi3 was trained on the DELETED 256 v2 tree (no
-  # _512_aug in its path), so it is NOT comparable to a 512_aug arm5 -- that reading needs a
-  # depth-only arm rerun on this tree first.
-  arm5) MIX="video+action@0.6,video+normal@0.4" ;;
-  # arm6 is the headline versatile model: one checkpoint, four streams selected by prompt tag.
-  # Four auxiliary streams is the CEILING on 788 variation0 episodes -- Argus (CVPR 2025) Tab.13
-  # loses accuracy on every task once its core task set outgrows its data, and we have three
-  # orders of magnitude less data than it does.
-  arm6) MIX="video+action@0.4,video+depth@0.2,video+segmentation@0.2,video+normal@0.2"; SEG_MODE_DEFAULT=scene_roles ;;
-  # arm7 inverts arm6's bet. arm6 spends 60% of its samples on PERCEPTION templates, which carry
-  # no action segment at all -- so counting action dropout only 0.4*0.9 = 36% of its steps produce
-  # any action gradient, and it has already plateaued (6000->8000 flat on train AND held-out).
-  # arm7 keeps <action> in EVERY template and varies only which visual space the observation lives
-  # in: 90% of its steps carry action, at IDENTICAL cost, because all four templates are still
-  # four segments of the same shape (V0|A0|V1|A1, D0|A0|D1|A1, S0|A0|S1|A1, N0|A0|N1|A1).
-  #
-  # THE CONTROL IS arm0, NOT arm6. outputs/specialist_action__seed42_fi3_512_aug_sr is
-  # video+action@1.0 on the same warm start / seed / tree / interval / lr, so it has the SAME 90%
-  # action-sample rate with one modality; arm7 - arm0 is "four observation modalities vs one at a
-  # fixed action budget". arm7 - arm6 confounds the menu with a 2.5x action-budget change.
-  #
-  # WHAT arm7 GIVES UP: there is no video+X template left, so this checkpoint cannot be asked
-  # RGB->depth/seg/normal. eval/eval_perception.py and eval/eval_all_masks.py would be reading it
-  # off-distribution, and --perception_mask_mix is INERT here (nothing reaches the action-free
-  # branch of plan_segments). Read it with eval/eval_action.py --template <X>+action instead.
-  # arm7u = arm7 的均匀采样对照。只改一个东西:四个模板等比例(0.25 x 4)而不是 0.4/0.2/0.2/0.2。
-  # 为什么要它:arm7@8000 实测四条路径【不】等价 —— normal 比 RGB 差 1.36x(n=80, p=0.005),
-  # depth 1.25x / seg 1.18x(p=0.093)。最朴素的解释是【更新次数不平衡】:arm7 里 RGB 占 0.4,
-  # 其余各 0.2,RGB 的更新次数是它们的两倍。均匀采样把这个解释直接消掉。
-  # 这是 CROSSMODAL_SUPERVISION_RESEARCH.md §6.1 排在所有机制之前的对照 —— 零代码,一个参数,
-  # 必须先排除它,才轮得到梯度调制/互教那些更贵的方案。
-  # 其余一切(A1 mask 轴、scene_roles、fi=3、512、variations 0、seed、warm start、lr)与 arm7 相同。
-  arm7u) MIX="video+action@0.25,depth+action@0.25,segmentation+action@0.25,normal+action@0.25"
+  # --- the observation-space ladder. video+action pinned at 0.4 on every rung with
+  #     perception; ratios sum to 1.0 because parse_template_mix normalises (see header).
+  arm0) MIX="video+action@1.0"
+        ACTION_MASK_MIX_DEFAULT=A1 ;;
+  arm1) MIX="video+action@0.4,depth+action@0.6"
+        ACTION_MASK_MIX_DEFAULT=A1 ;;
+  arm2) MIX="video+action@0.4,segmentation+action@0.6" 
+        SEG_MODE_DEFAULT=scene_roles
+        ACTION_MASK_MIX_DEFAULT=A1 ;;
+  arm3) MIX="video+action@0.4,normal+action@0.6"
+        ACTION_MASK_MIX_DEFAULT=A1 ;;
+  arm4) MIX="video+action@0.4,depth+action@0.3,segmentation+action@0.3"
+        SEG_MODE_DEFAULT=scene_roles
+        ACTION_MASK_MIX_DEFAULT=A1 ;;
+  arm5) MIX="video+action@0.4,normal+action@0.3,segmentation+action@0.3"
+        SEG_MODE_DEFAULT=scene_roles
+        ACTION_MASK_MIX_DEFAULT=A1 ;;
+  arm6) MIX="video+action@0.4,normal+action@0.3,depth+action@0.3"
         SEG_MODE_DEFAULT=scene_roles
         ACTION_MASK_MIX_DEFAULT=A1 ;;
   arm7) MIX="video+action@0.4,depth+action@0.2,segmentation+action@0.2,normal+action@0.2"
         SEG_MODE_DEFAULT=scene_roles
-        # Part of the arm DEFINITION, for the same reason SEG_MODE_DEFAULT is: A1 spends FIII (the
-        # cross-view mode, least relevant of the four to action quality) on policy mode, whose loss
-        # lands entirely on the action segments under the same single-frame conditioning the
-        # closed-loop rollout provides. Override with ACTION_MASK_MIX= to sweep the axis -- and
-        # use an explicit OUT= when you do, because the mix is NOT in the output path.
+        ACTION_MASK_MIX_DEFAULT=A1 ;;
+  # arm7's ratio control: same four templates, uniform, so every stream gets the same number of
+  # updates. Formerly `arm7u` -- that name still resolves below, to its own legacy directory.
+  arm8) MIX="video+action@0.25,depth+action@0.25,segmentation+action@0.25,normal+action@0.25"
+        SEG_MODE_DEFAULT=scene_roles
         ACTION_MASK_MIX_DEFAULT=A1 ;;
   *)    MIX="$ARM" ;;
 esac
 SEG_MODE="${SEG_MODE:-${SEG_MODE_DEFAULT:-referring}}"
 # The A axis (training/templates.py ACTION_MASK_MIX_PRESETS): how a template CONTAINING <action>
 # splits its conditioning, as (iiii, fiii, fifi, policy). A0 = the upstream literals, which is what
-# arm0-arm6 and the official step125750 were all trained under; the library default in
+# arm0-arm3, arm5, arm6 and the official step125750 were all trained under; the library default in
 # templates.py stays A0 so those stay reproducible and test_forward_unchanged.py keeps its
-# meaning. An arm that wants something else declares it in its case above -- same split of
-# responsibilities as FRAME_INTERVAL (3 here, 1 in args.py) and PERCEPTION_MASK_MIX (M2/M0).
+# meaning. An arm declares its CANONICAL plan in its case above -- same split of
+# responsibilities as FRAME_INTERVAL (3 here, 1 in args.py) and PERCEPTION_MASK_MIX (M2/M0) --
+# and this is the one axis you are EXPECTED to override, because flipping it is the ablation.
 ACTION_MASK_MIX="${ACTION_MASK_MIX:-${ACTION_MASK_MIX_DEFAULT:-A0}}"
 case "$SEG_MODE" in
   referring|scene_roles) ;;
@@ -216,13 +135,22 @@ FRAME_INTERVAL="${FRAME_INTERVAL:-3}"
 # and in the wandb config -- same split of responsibilities as FRAME_INTERVAL (3 here, 1 in args.py).
 # Set PERCEPTION_MASK_MIX=M0 to reproduce a pre-2026-08-14 arm.
 PERCEPTION_MASK_MIX="${PERCEPTION_MASK_MIX:-M2}"
-SLUG="$(echo "$ARM" | tr -c '[:alnum:]+' '_')"
-# The A axis goes in the RUN NAME (not the output path) when it is not the default, so an
-# A-axis sweep is distinguishable in wandb without renaming the arm's directory. Suppressed at
-# A0 so every arm0-arm6 run name stays byte-identical to what it was before this axis existed.
-AMM_SUFFIX=""
-[ "$ACTION_MASK_MIX" != "A0" ] && \
-  AMM_SUFFIX="-$(printf '%s' "$ACTION_MASK_MIX" | tr -c '[:alnum:]' '-')"
+# printf, not echo: `echo | tr -c` turns the trailing newline into a '_' as well, which is
+# where the double underscore in the historical outputs/arm0__seed42_fi3 came from. The A
+# suffix already breaks byte-identity with those directories (see the legacy note under OUT),
+# so the stray separator is dropped in the same breath rather than carried forever.
+SLUG="$(printf '%s' "$ARM" | tr -c '[:alnum:]+' '_')"
+LEGACY_SLUG="$(echo "$ARM" | tr -c '[:alnum:]+' '_')"   # pre-2026-09-19 spelling, for the note below
+# The A axis goes in the OUTPUT PATH and the run name, on EVERY run including A0 -- for exactly
+# the reason the interval, the tree and the seg protocol do: it changes what the arm IS. It is
+# also the axis most likely to be flipped, since flipping it IS ablation (a). It used to be
+# suppressed at A0 and kept out of the path, to preserve byte-identical arm0-arm6 run names;
+# the cost of that was `ACTION_MASK_MIX=A0 train_arm.sh arm7` landing in arm7's own directory
+# and resuming its A1 weights under an A0 label -- a hybrid no metric can be attributed to.
+# The byte-identity is gone instead: see the legacy-directory note under OUT.
+A_LOWER="$(printf '%s' "$ACTION_MASK_MIX" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]' '_')"
+A_SUFFIX="_${A_LOWER}"        # outputs/arm7_a1_seed42_...
+A_SUFFIX_DASH="-${A_LOWER}"   # wandb run name arm7-a1-seed42-...
 # The interval goes in the output path, because it changes what the arm IS. Without it,
 # FRAME_INTERVAL=3 on an existing arm0 directory would hit the resume path below and silently
 # continue the 20 Hz run instead of starting the 6.7 Hz one -- the exact failure the resume
@@ -236,6 +164,16 @@ FI_SUFFIX=""
 # existing arm0/arm1 directories still resume.
 DS_SUFFIX=""
 [ "$DATASET" != "rlbench_selfgen" ] && DS_SUFFIX="_${DATASET#rlbench_selfgen_}"
+# Multi-source joint runs pass DATASET as a full CombDataset spec ("a@0.4,b@0.2,c@0.4").
+# The @ratio must reach --dataset_name untouched (no @1.0 appended), and the raw spec is
+# unusable as a path/run-name fragment -- stamp a fixed _joint marker instead (set OUT=
+# explicitly for anything fancier).
+if [[ "$DATASET" == *"@"* ]]; then
+  DATASET_ARG="$DATASET"
+  DS_SUFFIX="_joint"
+else
+  DATASET_ARG="${DATASET}@1.0"
+fi
 # The seg protocol goes in the path for exactly the reason the interval and the tree do: it
 # changes what the arm IS. Without it a scene_roles arm1 lands in a referring arm1's directory,
 # hits the resume branch below, and silently continues from weights trained against a different
@@ -243,10 +181,25 @@ DS_SUFFIX=""
 # the existing arm0/arm1 directories still resume.
 SEG_SUFFIX=""
 [ "$SEG_MODE" = "scene_roles" ] && SEG_SUFFIX="_sr"
-OUT="${OUT:-$REPO/outputs/${SLUG}_seed${SEED}${FI_SUFFIX}${DS_SUFFIX}${SEG_SUFFIX}}"
+OUT_WAS_SET="${OUT:+1}"
+OUT="${OUT:-$REPO/outputs/${SLUG}${A_SUFFIX}_seed${SEED}${FI_SUFFIX}${DS_SUFFIX}${SEG_SUFFIX}}"
+# Every directory written before the A suffix existed (2026-09-19) lacks it, so the default OUT
+# no longer points at them: re-running such an arm STARTS A NEW RUN rather than resuming. That
+# is the safe direction -- a fresh directory is recoverable, a silent hybrid is not -- but it is
+# invisible, so say it out loud. The two in-flight joint runs pass OUT= explicitly and are
+# unaffected.
+if [ -z "$OUT_WAS_SET" ]; then
+  LEGACY_OUT="$REPO/outputs/${LEGACY_SLUG}_seed${SEED}${FI_SUFFIX}${DS_SUFFIX}${SEG_SUFFIX}"
+  if [ ! -d "$OUT" ] && [ -d "$LEGACY_OUT" ]; then
+    echo "note: $LEGACY_OUT exists and predates the _${A_LOWER} suffix -- this run will NOT resume it."
+    echo "      To continue that one instead:  OUT=$LEGACY_OUT bash scripts/train_arm.sh $ARM"
+  fi
+fi
 NPROC=$(echo "$GPUS" | tr ',' '\n' | grep -c .)
 # Stage 1 default. Empty string = from the Wan base (stage 2, see header).
-INIT_CKPT="${INIT_CKPT-/workspace/ttdu/starVLA/playground/Pretrained_models/anyeZHY/ActionImages/step125750.ckpt}"
+# Warm start. Default is repo-relative so a fresh clone works; fetch it once with
+#   huggingface-cli download anyeZHY/ActionImages step125750.ckpt --local-dir checkpoints/official
+INIT_CKPT="${INIT_CKPT-$REPO/checkpoints/official/step125750.ckpt}"
 # Warm-start needs ~10k steps; from-scratch needs the official 125k order of magnitude.
 if [ -n "$INIT_CKPT" ]; then STEPS="${STEPS:-10000}"; else STEPS="${STEPS:-125000}"; fi
 # Checkpoint cadence is a DISK vs RESOLUTION trade and it is expensive to get wrong BOTH ways.
@@ -263,6 +216,10 @@ if [ -n "$INIT_CKPT" ]; then STEPS="${STEPS:-10000}"; else STEPS="${STEPS:-12500
 # CKPT_EVERY=250 with SAVE_TOP_K=8 does NOT -- it keeps only the last 2k steps.
 CKPT_EVERY="${CKPT_EVERY:-2000}"
 SAVE_TOP_K="${SAVE_TOP_K:--1}"
+# SAVE_OPTIM=False drops DeepSpeed's global_step*/ so a checkpoint is 12GB instead of 120GB
+# and a save can never fill the volume mid-write (which killed both joint runs on
+# 2026-09-17). Crash-resume then restarts Adam moments and needs --allow_step_restart.
+SAVE_OPTIM="${SAVE_OPTIM:-True}"
 
 # /workspace is a shared 17T volume that outside tenants fill without warning, and it has been
 # observed swinging between 37GB and 265GB free within minutes (ttd DECISIONS.md D-038).
@@ -362,7 +319,7 @@ CUDA_VISIBLE_DEVICES=$GPUS torchrun --nnodes=1 --nproc_per_node=$NPROC --master_
   train.py \
   --deepspeed "$DS_CONFIG" \
   --dataset_path ./data \
-  --dataset_name "${DATASET}@1.0" \
+  --dataset_name "$DATASET_ARG" \
   --template_mix "$MIX" \
   --segmentation_mode "$SEG_MODE" \
   --variations "$VARIATIONS" \
@@ -379,11 +336,12 @@ CUDA_VISIBLE_DEVICES=$GPUS torchrun --nnodes=1 --nproc_per_node=$NPROC --master_
   --use_gradient_checkpointing \
   --dataloader_num_workers 4 --dataloader_prefetch_factor 2 --dataloader_pin_memory True \
   --checkpoint_every_n_steps "$CKPT_EVERY" --checkpoint_save_top_k "$SAVE_TOP_K" \
+  --save_optimizer_state "$SAVE_OPTIM" \
   --remove_unused_columns False --dataloader_drop_last True \
   --prediction_loss_only True --bf16 True --ddp_find_unused_parameters False \
   --save_safetensors False --per_device_train_batch_size 1 \
   --logging_steps 10 --seed "$SEED" \
-  --report_to wandb --run_name "${SLUG}-seed${SEED}${DS_SUFFIX//_/-}${AMM_SUFFIX}" ${EXTRA_ARGS:-}
+  --report_to wandb --run_name "${SLUG}${A_SUFFIX_DASH}-seed${SEED}${DS_SUFFIX//_/-}" ${EXTRA_ARGS:-}
 TRAIN_EXIT=$?
 echo "TRAIN_EXIT=$TRAIN_EXIT"
 exit "$TRAIN_EXIT"

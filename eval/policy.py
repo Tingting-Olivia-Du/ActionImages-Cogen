@@ -72,20 +72,24 @@ class ActionImagePolicy:
         from eval.anchor_encode import ANCHOR_TEMPLATE, ANCHOR_CONDITIONING
         # "all" = 融合模式:四条路径各生成一次再几何中位合并。此时这两个字段只是【初始值】,
         # run_policy_fused 每次调用会逐路径改写再还原,所以放 video 这条部署路径当占位。
-        if anchor_modality not in set(ANCHOR_TEMPLATE) | {"all"}:
-            raise ValueError(f"anchor_modality must be one of "
-                             f"{sorted(set(ANCHOR_TEMPLATE) | {'all'})}, got {anchor_modality!r}")
+        valid = set(ANCHOR_TEMPLATE) | {"all"}
+        if anchor_modality not in valid:
+            raise ValueError(f"anchor_modality must be one of {sorted(valid)}, got {anchor_modality!r}")
         self.fusion = anchor_modality == "all"
         self.anchor_modality = "video" if self.fusion else anchor_modality
         self.template = ANCHOR_TEMPLATE[self.anchor_modality]
-        # NOTE two unrelated things are called "fusion" here. `self.fusion` (anchor_modality
+        # NOTE three unrelated things are called "fusion" here. `self.fusion` (anchor_modality
         # "all") is the OLD 4-path geometric-median ENSEMBLE. anchor_modality "fusion" is the
-        # 10-segment fusion CANVAS. Both names are kept because existing reports use them.
+        # 10-segment fusion CANVAS asked under rgb_only (deployment). "fusion_full_anchor" is the
+        # SAME canvas asked with every modality's own real anchor -- one forward pass, not an
+        # ensemble -- to separate "the action head is wrong" from "rgb_only starves it of
+        # information it would use if it had it". Names are kept because existing reports use them.
         self._conditioning = ANCHOR_CONDITIONING.get(self.anchor_modality)
-        if anchor_modality == "fusion":
-            self.template = ANCHOR_TEMPLATE["fusion"]
-            self._conditioning = ANCHOR_CONDITIONING["fusion"]   # rgb_only
-            self.anchor_modality = "video"      # the one stream a rollout actually observes
+        self.full_anchor_fusion = anchor_modality == "fusion_full_anchor"
+        if anchor_modality in ("fusion", "fusion_full_anchor"):
+            self.template = ANCHOR_TEMPLATE[anchor_modality]
+            self._conditioning = ANCHOR_CONDITIONING[anchor_modality]   # rgb_only / full_anchor
+            self.anchor_modality = "video"      # placeholder; run_policy_full_anchor ignores it
         self.pipe = pipe
         self.num_frames = num_frames
         self.resolution = resolution
@@ -316,6 +320,70 @@ class ActionImagePolicy:
         self.last_frames = frames_by_mod.get("video", self.last_frames)
         self.last_poses_by_modality = {m: p for m, p in zip(anchors, poses)}
         return self.fuse_poses(poses)
+
+    @torch.no_grad()
+    def run_policy_full_anchor(self, anchors: dict, extrinsics, intrinsics, prompt: str,
+                               current_pose8=None, seed=None) -> np.ndarray:
+        """One replan through the 10-segment fusion canvas, `full_anchor` conditioning: every
+        visual modality gets its OWN real anchor frame instead of rgb_only's video-only anchor.
+
+        Unlike `run_policy_fused` (four independent single-modality queries + geometric-median
+        fusion), this is ONE forward pass through the SAME canvas the checkpoint trained on --
+        it asks "what does this checkpoint do when given the conditioning F1 sometimes withheld"
+        rather than "what do four unrelated checkpoints-of-one-modality agree on".
+
+        `anchors` = {modality: [V,H,W,3] uint8}, one real (not zero-filled) entry per visual
+        modality in `self.template` -- video, depth, segmentation, normal, each already through
+        its own codec (same shared RGB-cube encoding `_build_inputs` expects for any of them).
+        """
+        if current_pose8 is None:
+            raise ValueError(
+                "current_pose8 is required: the action segment's first frame is conditioning, "
+                "not prediction. Pass RolloutEnv.current_pose8(obs).")
+        from training.templates import VISUAL_MODALITIES, parse_template
+        device, dtype = self.pipe.device, torch.bfloat16
+        T = self.num_frames
+
+        video, camera, extr, intr = self._build_inputs(anchors["video"], extrinsics, intrinsics)
+        streams = {"video": video.to(device=device, dtype=dtype)}
+        for m in parse_template(self.template):
+            if m in VISUAL_MODALITIES and m != "video":
+                if m not in anchors:
+                    raise ValueError(
+                        f"full_anchor needs a real anchor for every visual modality in "
+                        f"{self.template!r}; missing {m!r} (got {sorted(anchors)})")
+                v, _, _, _ = self._build_inputs(anchors[m], extrinsics, intrinsics)
+                streams[m] = v.to(device=device, dtype=dtype)
+
+        a7 = self.pose8_to_action7(current_pose8)
+        action_7d = torch.from_numpy(np.repeat(a7[None], T, axis=0)).to(dtype).unsqueeze(0).to(device)
+
+        frames = self.pipe(
+            prompt=[prompt],
+            negative_prompt="",
+            template=self.template,
+            streams=streams,
+            fully_given_modalities=[],
+            conditioning_mode=self._conditioning,   # "full_anchor"
+            camera=camera.to(device=device, dtype=dtype),
+            action_7d=action_7d,
+            extrinsics=extr.to(device=device, dtype=dtype),
+            intrinsics=intr.to(device=device, dtype=dtype),
+            height=self.resolution,
+            width=self.resolution,
+            num_frames=T,
+            cfg_scale=self.cfg_scale,
+            num_inference_steps=self.num_inference_steps,
+            seed=self.seed if seed is None else seed,
+            tiled=False,
+            tile_size=(self.resolution // 16, self.resolution // 16),
+            tile_stride=(self.resolution // 32, self.resolution // 32),
+            enable_usp=False,
+            cfg_parallel=False,
+        )
+        self.n_calls += 1
+        self.last_frames = [np.asarray(f) for f in frames]
+        return self.decode(frames, extrinsics, intrinsics)
 
     # ------------------------------------------------------------------ decoding
     def decode(self, frames, extr_views: np.ndarray, intr_views: np.ndarray) -> np.ndarray:

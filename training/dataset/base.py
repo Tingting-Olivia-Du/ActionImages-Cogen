@@ -365,6 +365,8 @@ class CombDataset(torch.utils.data.Dataset):
         from training.dataset.rlbench import RLBenchMVDataset
         from training.dataset.droid import DROIDMVDataset
         from training.dataset.rlbench_selfgen import RLBenchSelfgenDataset
+        from training.dataset.maniskill3 import ManiSkill3Dataset
+        from training.dataset.behavior import BehaviorDataset
 
         name_to_ctor = {
             "bridge": lambda: BridgeMVDataset(
@@ -505,6 +507,49 @@ class CombDataset(torch.utils.data.Dataset):
                 height=height,
                 width=width,
                 template_mix=mix_for("rlbench_selfgen_512_aug_wide"),
+                prompt_tag_style=prompt_tag_style,
+                action_dropout_prob=action_dropout_prob,
+                strict_getitem=strict_getitem,
+                variations=variations,
+                segmentation_mode=segmentation_mode,
+            ),
+            # FORK: ManiSkill3 -- official ManiSkill demonstrations replayed into the selfgen
+            # layout by scripts/maniskill3_gen.py (4 randomized 512 cameras per episode, full
+            # five-modality GT; see training/dataset/maniskill3.py for the byte-level contract).
+            # frame_interval is PINNED to 1, like bridge's, because the sensible stride is a
+            # property of the SOURCE: episodes are native 20 Hz and 49-103 frames long, so the
+            # RLBench run default of 3 needs 121-frame windows and would degrade nearly every
+            # sample into a freeze-frame tail. At 1, a 41-frame window (~2 s) always fits.
+            # The `variations` split applies unchanged: the tree writes variation0 = training
+            # seeds, variation1 = held-out seeds of the same tasks.
+            "maniskill3": lambda: ManiSkill3Dataset(
+                base_path=os.path.join(dataset_path, "maniskill3"),
+                num_frames=num_frames,
+                frame_interval=1,
+                height=height,
+                width=width,
+                template_mix=mix_for("maniskill3"),
+                prompt_tag_style=prompt_tag_style,
+                action_dropout_prob=action_dropout_prob,
+                strict_getitem=strict_getitem,
+                variations=variations,
+                segmentation_mode=segmentation_mode,
+            ),
+            # FORK: BEHAVIOR-1K -- 2026-challenge raw demos replayed into the selfgen layout
+            # by behavior_demos/render_selfgen.py (manipulation chunks only, 4 randomized 512
+            # cameras; see training/dataset/behavior.py for the byte-level contract).
+            # frame_interval PINNED to 1 for the same source-property reason as maniskill3:
+            # chunks are rendered at 15 Hz (raw 30 Hz teleop, stride 2) and 48-240 frames
+            # long, so a 41-frame window (~2.7 s) always fits; the run default of 3 would
+            # need 121-frame windows and turn most chunks into freeze-frame tails.
+            # variation0 = train demos, variation1 = held-out demos of the same tasks.
+            "behavior": lambda: BehaviorDataset(
+                base_path=os.path.join(dataset_path, "behavior"),
+                num_frames=num_frames,
+                frame_interval=1,
+                height=height,
+                width=width,
+                template_mix=mix_for("behavior"),
                 prompt_tag_style=prompt_tag_style,
                 action_dropout_prob=action_dropout_prob,
                 strict_getitem=strict_getitem,

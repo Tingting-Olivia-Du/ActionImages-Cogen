@@ -259,6 +259,16 @@ class TrainingArguments(transformers.TrainingArguments):
     checkpoint_monitor: str = field(
         default="train_loss", metadata={"help": "Metric to monitor for best checkpoint selection."}
     )
+    save_optimizer_state: bool = field(
+        default=True,
+        metadata={"help": "Write DeepSpeed's global_step*/ (fp32 master + Adam moments, ~120GB "
+                          "per checkpoint at 5B/ZeRO-2) so the run is exactly resumable. Set "
+                          "False to save ONLY the 12GB stepN.ckpt: a checkpoint then costs 10x "
+                          "less disk and the save cannot fill the volume mid-write (that is how "
+                          "the 2026-09-17 joint runs died at step 2000), at the cost of "
+                          "crash-resume restarting Adam moments and the step counter "
+                          "(--resume_ckpt_path + --allow_step_restart)."},
+    )
     keep_optimizer_last_only: bool = field(
         default=True,
         metadata={"help": "Keep DeepSpeed resume state (global_step*/) only in the NEWEST "
