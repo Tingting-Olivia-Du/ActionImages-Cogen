@@ -262,10 +262,16 @@ def rollout_one(
 
     for step in range(max_steps):
         if gt_replay:
+            # HOLD THE LAST POSE rather than stopping when the demo runs out, so the GT
+            # ceiling is measured under the SAME step budget the model gets
+            # (max_steps_factor). A controller lags its target and anything still settling
+            # when the last waypoint is issued has not settled yet. Measured on ManiSkill's
+            # place_sphere, where the sphere has to come to rest inside a 5 mm tolerance:
+            # 12/20 stopping at the demo's end, 20/20 holding -- every one of those eight
+            # "failures" was the budget, not the harness.
+            action = demo_actions[min(step, len(demo_actions) - 1)]
             if step >= len(demo_actions):
-                stats.stop_reason = "demo exhausted"
-                break
-            action = demo_actions[step]
+                stats.stop_reason = "holding final pose"
         else:
             if step % steps_per_chunk == 0:
                 # The current pose is conditioning, not prediction -- see policy.run_policy.
