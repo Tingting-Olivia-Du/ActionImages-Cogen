@@ -70,23 +70,53 @@ ANCHOR_TEMPLATE = {"video": "video+action", "depth": "depth+action",
 # STANDING CAVEAT, the same one that probe carries: this model is ZERO-SHOT on RLBench renders
 # while ours is fine-tuned on exactly this distribution. A cascade row built on it bounds how
 # hard the task is; it does not rank the two designs on its own.
-SPECIALIST_REPO = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
+# CANDIDATES. Several are run and the STRONGEST becomes the counterpart, because picking a
+# weak one would flatter us -- the same discipline scripts/probe_normal_specialists.py already
+# applies to Lotus vs Marigold. The selection criterion is fixed in advance and is measured on
+# the EXPERT-CEILING row (expert on REAL frames), never on the cascade row: selecting on the
+# number you are about to report is selecting on your own result. See PERCEP_SIMREPLAY.md §6.
+#
+# Only METRIC models are listed. A scale-ambiguous model needs a fitted scale, and until the
+# anchor-frame affine fit is implemented it would be scored on a handicap it never signed up
+# for. `metric` in probe_depth_baselines.py is {depthpro, da2metric, unidepth, metric3d}.
+DEPTH_EXPERTS = {
+    "da2metric": "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf",
+    "depthpro":  "apple/DepthPro-hf",
+    "unidepth":  "lpiccinelli/unidepth-v2-vitl14",   # needs the `unidepth` package
+}
+SPECIALIST_NAME = os.environ.get("SPECIALIST", "da2metric")
 _SPECIALIST = {}
 
 
 def _specialist(dev=None):
-    if "depth" not in _SPECIALIST:
+    """Metric depth expert -> callable(rgb_u8[, K]) -> depth in metres, 0 free parameters."""
+    key = SPECIALIST_NAME
+    if key not in _SPECIALIST:
         dev = int(os.environ.get("SPECIALIST_GPU", "0")) if dev is None else dev
         import torch
-        from PIL import Image
-        from transformers import pipeline
-        pipe = pipeline("depth-estimation", model=SPECIALIST_REPO, device=dev)
-        def infer(rgb_u8, K=None):
-            d = pipe(Image.fromarray(np.ascontiguousarray(rgb_u8)))["predicted_depth"]
-            d = d.float().cpu().numpy() if torch.is_tensor(d) else np.asarray(d, np.float32)
-            return np.squeeze(d)
-        _SPECIALIST["depth"] = infer
-    return _SPECIALIST["depth"]
+        if key not in DEPTH_EXPERTS:
+            raise ValueError(f"unknown specialist {key!r}; have {sorted(DEPTH_EXPERTS)}")
+        if key == "unidepth":
+            # Ships its own package rather than a transformers config. Absent here as of
+            # 2026-09-20 (weights cached, module missing), which is the only reason da2metric
+            # is the default -- it is an availability call, not a quality one.
+            from unidepth.models import UniDepthV2
+            m = UniDepthV2.from_pretrained(DEPTH_EXPERTS[key]).to(f"cuda:{dev}").eval()
+            def infer(rgb_u8, K=None):
+                x = torch.from_numpy(np.ascontiguousarray(rgb_u8)).permute(2, 0, 1).to(f"cuda:{dev}")
+                Kt = None if K is None else torch.from_numpy(np.asarray(K, np.float32)).to(f"cuda:{dev}")
+                with torch.no_grad():
+                    return m.infer(x, Kt)["depth"].squeeze().float().cpu().numpy()
+        else:
+            from PIL import Image
+            from transformers import pipeline
+            pipe = pipeline("depth-estimation", model=DEPTH_EXPERTS[key], device=dev)
+            def infer(rgb_u8, K=None):
+                d = pipe(Image.fromarray(np.ascontiguousarray(rgb_u8)))["predicted_depth"]
+                d = d.float().cpu().numpy() if torch.is_tensor(d) else np.asarray(d, np.float32)
+                return np.squeeze(d)
+        _SPECIALIST[key] = infer
+    return _SPECIALIST[key]
 
 
 def absrel(pred, gt):
@@ -235,6 +265,10 @@ def main():
                                                         "percep_dump"))
     ap.add_argument("--out", default=os.path.join(REPO, "reports", "percep_simreplay",
                                                   "scores.json"))
+    ap.add_argument("--specialist", default=None, choices=sorted(DEPTH_EXPERTS),
+                    help="which metric depth expert the cascade rows use. Run ALL of them on "
+                         "the expert-ceiling row first and take the strongest; see "
+                         "PERCEP_SIMREPLAY.md 6. The chosen name is recorded in the output.")
     ap.add_argument("--gpu", type=int, default=None,
                     help="GPU for the cascade specialist. The rollout campaign occupies 0-3 "
                          "with ~19 GB headroom each, so a 1.3 GB depth model coexists, but "
@@ -242,6 +276,9 @@ def main():
     a = ap.parse_args()
     if a.gpu is not None:
         os.environ["SPECIALIST_GPU"] = str(a.gpu)
+    if a.specialist is not None:
+        global SPECIALIST_NAME
+        SPECIALIST_NAME = a.specialist
     out = defaultdict(list)
     for tagdir in sorted(glob.glob(os.path.join(a.dump_root, "*"))):
         tag = os.path.basename(tagdir)
@@ -277,7 +314,8 @@ def main():
                     "exec_gap_m_median": round(float(np.mean(gap)), 5) if gap else None,
                     "n_frames": int(sum(r["n_frames"] for r in rs))}
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
-    json.dump({"per_trial": out, "aggregate": agg}, open(a.out, "w"), indent=1)
+    json.dump({"specialist": SPECIALIST_NAME, "specialist_repo": DEPTH_EXPERTS[SPECIALIST_NAME],
+               "per_trial": out, "aggregate": agg}, open(a.out, "w"), indent=1)
     print(f"\nwrote {a.out}")
     for tag, v in sorted(agg.items()):
         dv = "   --  " if v["dyn_value"] is None else f"{v['dyn_value']:7.4f}"

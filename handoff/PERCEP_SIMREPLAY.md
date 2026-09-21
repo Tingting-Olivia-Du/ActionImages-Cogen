@@ -162,22 +162,56 @@ frames. ManiSkill needs its held-out tree for the same reason.
 
 ### External expert models
 
-Cached to `~/.cache/huggingface` on first use; pre-download on a machine with no egress:
+**Download all the candidates, run all of them, and keep the strongest per modality.** One
+expert is not enough: if the single expert you picked is weak on synthetic renders, the cascade
+row measures that weakness and says nothing about sequencing. The selection protocol is §6.
 
-| modality | model | note |
-|---|---|---|
-| depth | `depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf` | **metric** → zero free parameters, transformers-native |
-| normal | `jingheya/lotus-normal-g-v1-1` | needs the Lotus repo on `sys.path` (see `scripts/probe_normal_specialists.py`) |
-| segmentation | `CIDAS/clipseg-rd64-refined` | receives the scene-role vocabulary |
+| modality | candidate | HF id | class | free params/frame |
+|---|---|---|---|---|
+| depth | DA V2-L metric | `depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf` | **metric** | 0 |
+| depth | Depth Pro | `apple/DepthPro-hf` | **metric** | 0 |
+| depth | UniDepth V2-L | `lpiccinelli/unidepth-v2-vitl14` | **metric** (needs K) | 0 |
+| depth | DA3-L | `depth-anything/DA3-Large` | depth, scale-free | 1 |
+| depth | DA V2-L | `depth-anything/Depth-Anything-V2-Large-hf` | disparity | 2 |
+| depth | VGGT-1B | `facebook/VGGT-1B` | scale-free | 1 |
+| depth | Lotus-G depth | `jingheya/lotus-depth-g-v2-0-disparity` | disparity | 2 |
+| depth | Marigold depth | `prs-eth/marigold-depth-v1-1` | affine-invariant | 2 |
+| normal | Lotus-G normal | `jingheya/lotus-normal-g-v1-1` | — | 0 |
+| normal | Marigold-Normals | `prs-eth/marigold-normals-v1-1` | — | 0 |
+| normal | normals from DA V2 | (derived from its depth) | — | 0 |
+| seg | CLIPSeg | `CIDAS/clipseg-rd64-refined` | named | — |
+| seg | SAM ViT-H | `facebook/sam-vit-huge` | class-agnostic | — |
 
 ```bash
-huggingface-cli download depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf
-huggingface-cli download jingheya/lotus-normal-g-v1-1
-huggingface-cli download CIDAS/clipseg-rd64-refined
+for m in depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf apple/DepthPro-hf \
+         lpiccinelli/unidepth-v2-vitl14 depth-anything/DA3-Large \
+         depth-anything/Depth-Anything-V2-Large-hf facebook/VGGT-1B \
+         jingheya/lotus-depth-g-v2-0-disparity prs-eth/marigold-depth-v1-1 \
+         jingheya/lotus-normal-g-v1-1 prs-eth/marigold-normals-v1-1 \
+         CIDAS/clipseg-rd64-refined facebook/sam-vit-huge; do
+  huggingface-cli download "$m"
+done
+pip install unidepth      # weights cache without it, the module does not; see 6
 ```
 
-UniDepth V2 would be an equivalent metric depth expert but ships its own package, which is not
-installed here; DA V2 Metric was chosen purely on availability. Either is fine — but §9.4.
+Notes that decide which candidates are even eligible:
+
+- **Only the three metric models can be scored with zero free parameters**, which is what our
+  codec faces. `probe_depth_baselines.py` declares `METRIC = {depthpro, da2metric, unidepth,
+  metric3d}`. The rest need a fitted scale, and the anchor-frame affine fit is not implemented
+  yet (§9.4, §10.4) — so **prefer a metric model for the main table** and keep the others for
+  the appendix sweep.
+- **UniDepth V2's weights cache but its module does not.** `da2metric` is the current default
+  purely because `unidepth` was not installed on this machine — an availability call, not a
+  quality one. Install it and it becomes a candidate.
+- **SAM cannot enter the mIoU cell.** It emits unnamed regions and there is no vocabulary in
+  common with our role map, so it is only scorable as class-agnostic bo-IoU
+  (`probe_sam_vs_ours.py`), with its mask count reported beside it because best-overlap IoU
+  rewards over-segmentation.
+- **Normals need a calibrated sign convention.** Our GT normals come from `depth_to_normal`
+  (x-right, y-**down**, z-away); normal benchmarks generally use y-up, z-toward. Getting it
+  wrong silently flips the cosine. `probe_normal_specialists.py` scores all four sign
+  conventions and reports every one — keep that behaviour.
 
 ---
 
@@ -274,19 +308,61 @@ python scripts/score_sim_replay.py --gpu 1        # -> reports/percep_simreplay/
 ≈ 44 s per trial for a direct depth row, ≈ 5 s for a cascade row. Rescoring reads only the
 `.npz` dumps — **never re-run a rollout to change a metric.**
 
-### The expert ceiling row
+### Expert selection — run them all, keep the strongest
 
-`GT RGB → expert` needs no rollout: run the expert on **real** frames of the same episodes.
+**Do this BEFORE any cascade scoring.** It fills the `Expert ceiling` row of Table 2 and it
+picks which expert the cascade rows use. It needs no rollout and no checkpoint: it runs each
+expert on **real** frames of the same episodes.
 
 ```bash
-DATA_TREE=$PWD/data/rlbench_unseen_tasks_512_clean \
-EPS_FILE=/tmp/eps.txt SPLIT_TAG=_simreplay5 \
-python scripts/probe_depth_baselines.py da2metric 20
+printf '%s' "$(for t in close_microwave toilet_seat_down close_box meat_on_grill; do
+                 for i in 0 1 2 3 4; do printf '%s/variation0/episodes/episode%s,' $t $i; done
+               done)" | sed 's/,$//' > /tmp/eps.txt
+
+for m in da2metric depthpro unidepth da3 da2 vggt lotusdepth marigolddepth; do
+  DATA_TREE=$PWD/data/rlbench_unseen_tasks_512_clean \
+  EPS_FILE=/tmp/eps.txt SPLIT_TAG=_simreplay5 \
+  python scripts/probe_depth_baselines.py "$m" 20
+done
+python scripts/probe_normal_specialists.py          # Lotus-G and Marigold, both
+python scripts/probe_named_seg_baseline.py          # CLIPSeg
+python scripts/collect_counterparts.py              # -> one table over reports/external/
 ```
 
-where `/tmp/eps.txt` is a comma-separated list like
-`close_microwave/variation0/episodes/episode0,...`. Output lands in `reports/external/`.
-**Run this first** — see §9.4; it decides whether the cascade rows can be read at all.
+**The selection rule, fixed in advance:**
+
+> Per modality, the counterpart is the candidate with the best score **on the expert-ceiling
+> row** (expert on real frames), among candidates with the fewest free parameters. Ties go to
+> the metric model. The full sweep goes in the appendix; the main table names the winner.
+
+Three properties of that rule matter, and none is negotiable:
+
+1. **Selection is on the CEILING row, never on the cascade row.** The cascade row is the number
+   being reported; choosing an expert by it is selecting on your own result. The ceiling row is
+   independent of which arm generated the frames, so it cannot leak.
+2. **Strongest, not weakest.** Picking a weak counterpart flatters us. This is the same
+   discipline `probe_normal_specialists.py` already states for Lotus vs Marigold: *"Both are
+   run, and the stronger one becomes the counterpart — picking the weaker would flatter us."*
+   If co-generation still wins against the best available expert, the claim is worth something.
+3. **Fewest free parameters first.** A model needing a scale fitted against ground truth is not
+   competing on our terms; that asymmetry is a result, not a nuisance to normalise away
+   (`Tables/tab_percep.tex`). So a metric model that scores slightly worse still beats an
+   aligned model that scores better — and if you report an aligned one, it is a **separate
+   named row with its alignment protocol declared**, exactly as the Table 2 caption requires.
+
+Then score the cascade with the winner:
+
+```bash
+python scripts/score_sim_replay.py --specialist depthpro --gpu 1
+```
+
+The chosen name and HF id are written into `scores.json` so a number can never be traced to the
+wrong expert.
+
+**Reference from this machine (2026-09-20):** DA V2 Metric Indoor-L on real frames scored
+AbsRel **0.395 raw** / 0.111 median-aligned, ρ = +0.980 — structure fine, metric scale broken on
+synthetic renders. That is why one expert is not enough: with only that candidate you cannot
+tell "metric monocular depth does not transfer to this domain" from "this one model is weak".
 
 ### The dump
 
@@ -385,11 +461,14 @@ before trusting arms 1–6.
    AbsRel **0.395 raw on REAL frames** of these tasks (ρ = +0.980, median-aligned 0.111) — its
    structure is fine, its metric scale is broken on synthetic renders. Both cascades land near
    0.38 regardless of whose RGB they read, so those rows currently measure a zero-shot domain
-   gap. **Run the expert-ceiling row first**; if the ceiling is already worse than an arm's
-   direct row, the cascade proves nothing about sequencing. The expert is presently given
-   **zero** free parameters; `Tables/tab_percep.tex`'s convention would grant a two-parameter
-   affine fit **to the anchor frame only**, which is NOT yet implemented and would move it
-   toward ~0.11. Report both columns; the conclusion flips between them.
+   gap. **Run the whole expert sweep first (§6) and take the strongest**; with one candidate you
+   cannot tell "metric monocular depth does not transfer here" from "this one model is weak".
+   If the ceiling is already worse than an arm's direct row, the cascade proves nothing about
+   sequencing and the row should say so rather than be read as a win. The expert is presently
+   given **zero** free parameters; `Tables/tab_percep.tex`'s convention would grant a
+   two-parameter affine fit **to the anchor frame only**, which is NOT yet implemented and would
+   move it toward ~0.11. Report both columns; the conclusion flips between them.
+   **Never choose the expert by the cascade row** — that is selecting on the number you report.
 5. **Fine-tuned vs zero-shot.** Our arms are trained on exactly this render distribution; the
    experts are not. A cascade row bounds how hard the task is; it does not rank the designs. The
    only clean fix is training a `video+depth` expert on the same tree — no arm in the ladder
@@ -420,5 +499,9 @@ In priority order. Each is needed for a block of Table 2 that is currently blank
    `eval/rollout_maniskill.py`'s loop does not write the dump. Port the ~20 lines from
    `eval/rollout.py`. Until then every ManiSkill cell and `All avg.` stays blank.
 4. **The anchor-frame affine column for cascades.** §9.4.
-5. **Normal and segmentation expert rows** (Lotus-G, CLIPSeg) in the scorer's cascade branch,
-   which currently only knows depth.
+5. **Normal and segmentation expert rows** in the scorer's cascade branch, which currently
+   knows depth only. Both modalities have two or three candidates (§4) and the same
+   run-them-all-keep-the-strongest rule applies.
+6. **Scale-ambiguous depth experts as cascade rows.** DA3, DA V2, VGGT, Lotus and Marigold are
+   downloaded and sweepable on the ceiling row today, but cannot be cascade rows until the
+   anchor-frame affine fit (item 4) exists. Until then they belong in the appendix sweep.
