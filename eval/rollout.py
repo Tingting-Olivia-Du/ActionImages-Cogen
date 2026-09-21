@@ -232,7 +232,7 @@ def rollout_one(
     extr, intr = env.camera_params(obs)
     # seg 的角色 LUT 必须【每个 episode 现场建】:CoppeliaSim 按加载顺序编 handle,
     # 离线的映射对实时场景不成立(rollout_env.handle_names 注释里有实例)。
-    seg_lut = None
+    seg_lut = seg_present = None
     if getattr(env, "anchor_modality", "video") in ("segmentation", "all"):
         from eval.anchor_encode import build_live_role_lut, unknown_fraction
         mv = env.views_mask(obs)
@@ -244,7 +244,28 @@ def rollout_one(
             raise RuntimeError(
                 f"{task} trial {trial}: 实时角色图有 {unk:.2%} 的 unknown 像素"
                 f"(训练数据里恒为 0)。未映射 handle: {unmapped[:8]}")
-        seg_lut = lut
+        seg_lut, seg_present = lut, present
+    # The sim-replay dump needs the SAME live LUT whatever the anchor: segmentation is scored
+    # against `sim_mask` through it, and the Arm-7 segmentation CASCADE comes from a
+    # VIDEO-anchored run, where the block above never executes. It cannot be rebuilt from the
+    # training tree afterwards (handles are numbered by load order), so it is captured here.
+    # Unlike the anchor path this must not raise on unmapped handles: an RGB-anchored policy
+    # never sees the role map, so an annotation gap only costs those pixels at scoring time,
+    # where they are excluded as `unknown`. The fraction is recorded so that is visible.
+    dump_lut = dump_present = dump_unk = None
+    if dump_dir is not None and getattr(env, "_need_mask", False):
+        if seg_lut is not None:
+            dump_lut, dump_present = seg_lut, seg_present
+        else:
+            try:
+                from eval.anchor_encode import build_live_role_lut, unknown_fraction
+                mv = env.views_mask(obs)
+                dump_lut, dump_present, _unm = build_live_role_lut(task, mv, env.handle_names(mv))
+            except Exception as exc:          # a task with no resolvable roles: seg unscorable
+                print(f"  [dump] {task} trial {trial}: no live role LUT ({exc})", flush=True)
+        if dump_lut is not None:
+            from eval.anchor_encode import unknown_fraction
+            dump_unk = float(unknown_fraction(env.views_mask(obs), dump_lut))
     # How many env.step()s one generated chunk is worth once interpolated.
     steps_per_chunk = execution_horizon if not interpolate else (execution_horizon - 1) * frame_interval + 1
 
@@ -406,6 +427,10 @@ def rollout_one(
             payload["sim_mask"] = np.stack(dump_mask)
         if dump_rgb:
             payload["sim_rgb"] = np.stack(dump_rgb)
+        if dump_lut is not None:
+            payload["seg_lut"] = np.asarray(dump_lut, np.uint8)
+            payload["seg_present"] = np.asarray(list(dump_present))
+            payload["seg_unknown_frac"] = np.float32(dump_unk if dump_unk is not None else np.nan)
         extr, intr = env.camera_params(obs)
         payload["extrinsics"], payload["intrinsics"] = extr, intr
         # savez_compressed, not savez: the canvas is a 4-segment 512^2 uint8 stack (~129 MB per

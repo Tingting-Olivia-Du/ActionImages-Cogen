@@ -13,6 +13,7 @@
 #   bash scripts/run_percep_simreplay.sh                       # everything in CONFIGS x TASKS
 #   CONFIGS="arm1_depth arm1_video" TASKS=close_box bash scripts/run_percep_simreplay.sh
 #   CKPT_MANIFEST=/path/ckpts.txt bash scripts/run_percep_simreplay.sh
+#   DRY_RUN=1 bash scripts/run_percep_simreplay.sh              # print the queue, launch nothing
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${EVAL_RC:-/workspace/1228_tingting/ttd/scripts/env_eval_ttd_eval.rc}"
@@ -41,18 +42,22 @@ declare -A NATIVE=(
 )
 # Arms trained with a segmentation stream were trained under scene_roles, which is part of the
 # arm's DEFINITION, not a preference (train_arm.sh SEG_MODE_DEFAULT).
-DEFAULT_CONFIGS=""
-for a in arm0 arm1 arm2 arm3 arm4 arm5 arm6 arm7; do
-  for m in ${NATIVE[$a]}; do DEFAULT_CONFIGS="$DEFAULT_CONFIGS ${a}_${m}"; done
-done
-CONFIGS="${CONFIGS:-$DEFAULT_CONFIGS}"
-
 if [ ! -f "$CKPT_MANIFEST" ]; then
   echo "!! no checkpoint manifest at $CKPT_MANIFEST"
   echo "   Write one line per arm:   arm1 /abs/path/to/step4000.ckpt"
   exit 2
 fi
 ckpt_of() { awk -v a="$1" '$1==a {print $2; exit}' "$CKPT_MANIFEST"; }
+# Default = every native (arm, anchor) pair of the arms LISTED IN THE MANIFEST. Defaulting to all
+# eight arms would make one missing line (say arm7 before its download finishes) refuse the
+# whole campaign. An explicit CONFIGS still gets the full check below.
+DEFAULT_CONFIGS=""
+for a in arm0 arm1 arm2 arm3 arm4 arm5 arm6 arm7; do
+  [ -n "$(ckpt_of "$a")" ] || continue
+  for m in ${NATIVE[$a]}; do DEFAULT_CONFIGS="$DEFAULT_CONFIGS ${a}_${m}"; done
+done
+CONFIGS="${CONFIGS:-$DEFAULT_CONFIGS}"
+[ -n "${CONFIGS// /}" ] || { echo "!! $CKPT_MANIFEST lists no known arm (arm0..arm7)"; exit 2; }
 
 # Refuse impossible jobs UP FRONT rather than 25 minutes into a rollout.
 BAD=0
@@ -71,6 +76,14 @@ QUEUE="$LOGS/queue.txt"; : > "$QUEUE"
 for cfg in $CONFIGS; do for t in $TASKS; do echo "$cfg $t" >> "$QUEUE"; done; done
 LOCK="$LOGS/queue.lock"; : > "$LOCK"
 echo "queued $(wc -l < "$QUEUE") jobs over GPUS='$GPUS' at $TRIALS trials each"
+# DRY_RUN=1: show exactly what would run, then stop -- nothing is launched, no GPU is touched.
+# Use it before every real launch; the checks above (native modality, checkpoint present) have
+# already run by this point, so a clean dry run means the real one will start.
+if [ "${DRY_RUN:-0}" = "1" ]; then
+  echo "DRY_RUN=1 -- not launching. Jobs (config task):"; cat "$QUEUE"
+  for cfg in $CONFIGS; do echo "  ${cfg%_*} -> $(ckpt_of "${cfg%_*}")"; done | sort -u
+  exit 0
+fi
 
 worker() {
   local gpu="$1"

@@ -1,0 +1,11 @@
+{
+ "depth:direct": {
+  "value": 0.05055,
+  "copy_anchor": 0.08234,
+  "dyn_value": 0.25909,
+  "dyn_copy_anchor": 0.48902,
+  "dyn_frac": 0.13842,
+  "n_frames": 56,
+  "exec_gap_m_median": 0.00053
+ }
+}

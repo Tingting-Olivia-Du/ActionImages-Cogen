@@ -1,0 +1,30 @@
+{
+ "rgb:direct": {
+  "value": 0.0,
+  "copy_anchor": 0.10693,
+  "dyn_value": 0.0,
+  "dyn_copy_anchor": 0.50856,
+  "n_frames": 74
+ },
+ "seg:direct": {
+  "value": 1.0,
+  "copy_anchor": 0.69156,
+  "dyn_value": 1.0,
+  "dyn_copy_anchor": 0.15373,
+  "n_frames": 74
+ },
+ "depth:direct": {
+  "value": 0.00067,
+  "copy_anchor": 0.04383,
+  "dyn_value": 0.00083,
+  "dyn_copy_anchor": 0.51477,
+  "n_frames": 74
+ },
+ "normal:direct": {
+  "value": 0.99999,
+  "copy_anchor": 0.96474,
+  "dyn_value": 0.99999,
+  "dyn_copy_anchor": 0.67811,
+  "n_frames": 74
+ }
+}
