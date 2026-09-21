@@ -161,6 +161,7 @@ def rollout_one(
     prompt_tag_style: str = "explicit",
     skip_low_confidence: bool = False,
     skip_anchor_frames: int = 4,
+    dump_dir: Optional[str] = None,
 ) -> Dict:
     """One episode. `gt_replay=True` runs the demo's own actions instead of the policy, which
     is the no-GPU self-check: it must succeed, or a model failure is uninterpretable."""
@@ -256,6 +257,22 @@ def rollout_one(
     # only way to tell "the world model is wrong" apart from "the action decode is wrong".
     sim_frames: List[np.ndarray] = []
     gen_frames: List[np.ndarray] = []   # the model's generated canvas, per replan
+    # --- sim-replay perception dump -------------------------------------------------------
+    # The counterfactual ground truth for "what the model imagined": at every executed step,
+    # what the SIMULATOR renders after actually running the model's own decoded actions. This
+    # is the only target that does not charge the model for failing to reproduce the demo.
+    # Saved raw (never through the mp4 writer): the depth codec is a colour path, and H.264
+    # chroma subsampling turns a metric depth map into a differently-metric depth map silently.
+    # `cmd`/`ach` are the commanded and ACHIEVED end-effector poses. Their gap is the protocol's
+    # own noise floor -- the imagined depth belongs to the pose the model drew, while the render
+    # belongs to the pose IK actually reached -- and a perception number quoted without it is
+    # not interpretable.
+    dump_canvas: List[np.ndarray] = []      # [4*T, H, W, 3] uint8, one per replan
+    dump_depth: List[np.ndarray] = []       # [V, H, W] float16 metric, one per executed step
+    dump_mask: List[np.ndarray] = []        # [V, H, W] uint16 handle map, one per executed step
+    dump_rgb: List[np.ndarray] = []         # [V, H, W, 3] uint8, one per executed step
+    dump_steps: List[Dict] = []             # step -> which canvas frame produced it
+    dumping = dump_dir is not None
     if record_video:
         sim_frames.append(env.views_rgb(obs).copy())
     t0 = time.time()
@@ -309,6 +326,8 @@ def rollout_one(
                 debug_trace.append({"step": step, **getattr(policy, "last_debug", {})})
                 if record_video and getattr(policy, "last_frames", None):
                     gen_frames.extend(policy.last_frames)
+                if dumping and getattr(policy, "last_frames", None):
+                    dump_canvas.append(np.stack(policy.last_frames).astype(np.uint8))
                 chunk_conf = getattr(policy, "last_confidence", None)
                 if chunk_conf is not None:
                     chunk_conf = np.asarray(chunk_conf)[:len(chunk)]
@@ -338,12 +357,61 @@ def rollout_one(
         obs = res.obs
         if record_video:
             sim_frames.append(env.views_rgb(obs).copy())
+        if dumping:
+            # `k` is the index INTO THE CHUNK, i.e. into the generated canvas's action segment,
+            # so it is also the index of the perception frame the model drew for this moment.
+            # Frames below `skip_anchor_frames` were overwritten by `ramp_from_current` above
+            # and are NOT what the model predicted -- recorded, but flagged so the scorer drops
+            # them rather than charging the ramp to the perception stream.
+            dump_steps.append({
+                "step": step,
+                "replan": max(len(dump_canvas) - 1, 0),
+                "k": int(k) if not gt_replay else -1,
+                "is_ramp": bool((not gt_replay) and int(k) < skip_anchor_frames),
+                "cmd": np.asarray(action, dtype=np.float32).tolist(),
+                "ach": env.current_pose8(obs).astype(np.float32).tolist(),
+            })
+            if getattr(env, "_need_depth", False):
+                dump_depth.append(env.views_depth(obs).astype(np.float16))
+            if getattr(env, "_need_mask", False):
+                dump_mask.append(env.views_mask(obs).astype(np.uint16))
+            # LOSSLESS simulator RGB, which is the counterfactual target for the future-RGB row
+            # of Tab. 2. `sim_frames` above holds the same pixels but is written out as an mp4,
+            # and an LPIPS scored on H.264 output measures the codec as much as the model.
+            dump_rgb.append(env.views_rgb(obs).copy())
         if res.success:
             stats.success = True
             stats.stop_reason = "success"
             break
     else:
         stats.stop_reason = "timeout"
+
+    dump_path = None
+    if dumping and dump_steps:
+        os.makedirs(dump_dir, exist_ok=True)
+        stem = f"{task}_v{variation}_t{trial}"
+        dump_path = os.path.join(dump_dir, f"{stem}.npz")
+        payload = {
+            "canvas": np.stack(dump_canvas) if dump_canvas else np.zeros((0,), np.uint8),
+            "cmd": np.asarray([d["cmd"] for d in dump_steps], np.float32),
+            "ach": np.asarray([d["ach"] for d in dump_steps], np.float32),
+            "step": np.asarray([d["step"] for d in dump_steps], np.int32),
+            "replan": np.asarray([d["replan"] for d in dump_steps], np.int32),
+            "k": np.asarray([d["k"] for d in dump_steps], np.int32),
+            "is_ramp": np.asarray([d["is_ramp"] for d in dump_steps], bool),
+        }
+        if dump_depth:
+            payload["sim_depth"] = np.stack(dump_depth)
+        if dump_mask:
+            payload["sim_mask"] = np.stack(dump_mask)
+        if dump_rgb:
+            payload["sim_rgb"] = np.stack(dump_rgb)
+        extr, intr = env.camera_params(obs)
+        payload["extrinsics"], payload["intrinsics"] = extr, intr
+        # savez_compressed, not savez: the canvas is a 4-segment 512^2 uint8 stack (~129 MB per
+        # replan raw) and the depth-codec colour path is smooth enough to deflate well. Measured
+        # on the smoke test before committing to a campaign-sized dump.
+        np.savez_compressed(dump_path, **payload)
 
     video_path = gen_path = None
     if record_video and video_dir:
@@ -370,6 +438,7 @@ def rollout_one(
         "variation": variation,
         "sim_video": video_path,
         "generated_video": gen_path,
+        "percep_dump": dump_path,
         "trial": trial,
         "scene_seed": seed,
         "prompt": prompt,
@@ -470,6 +539,16 @@ def main():
     ap.add_argument("--gt-replay", action="store_true",
                     help="replay each scene's own demo instead of the policy (no GPU, no model)")
     ap.add_argument("--out", default=str(REPO / "reports" / "closedloop"))
+    ap.add_argument("--dump-percep", action="store_true",
+                    help="save, per trial, the model's raw generated canvas and the SIMULATOR's "
+                         "own depth/mask at every executed step -- the counterfactual ground "
+                         "truth for the sim-replay perception eval. Forces the extra renders on "
+                         "regardless of --anchor-modality, which is what lets the RGB-only arm "
+                         "(no depth+action template, so necessarily anchor=video) be scored at "
+                         "all. Costs sim time on EVERY step and ~tens of MB per trial.")
+    ap.add_argument("--dump-max-trials", type=int, default=0,
+                    help="dump only the first N trials of each task (0 = all). The dump is for "
+                         "scoring perception, which needs far fewer trials than a success rate.")
     args = ap.parse_args()
 
     if not args.gt_replay and not args.null_cross_scene and not args.ckpt:
@@ -521,9 +600,13 @@ def main():
         env_anchor_modality = "all"
     else:
         env_anchor_modality = args.anchor_modality
+    # The dump needs the simulator's own depth AND handle map at every step, whatever the
+    # policy is anchored on -- see RolloutEnv.extra_renders.
+    extra_renders = ("depth", "mask") if args.dump_percep else ()
     with RolloutEnv(resolution=args.res, headless=True,
                     arm_action_mode=args.arm_action_mode,
-                    anchor_modality=env_anchor_modality) as env:
+                    anchor_modality=env_anchor_modality,
+                    extra_renders=extra_renders) as env:
         print(f"env up; tasks={args.tasks} trials={args.num_trials} "
               f"execution_horizon={args.execution_horizon} arm={args.arm_action_mode} "
               f"gt_replay={args.gt_replay}", flush=True)
@@ -544,6 +627,10 @@ def main():
                         skip_low_confidence=args.skip_low_confidence,
                         skip_anchor_frames=args.skip_anchor_frames,
                         max_ik_fail_streak=args.max_ik_fail_streak,
+                        dump_dir=(os.path.join(args.out, "percep_dump", args.tag)
+                                  if args.dump_percep and (args.dump_max_trials <= 0
+                                                           or trial < args.dump_max_trials)
+                                  else None),
                     )
                 except Exception as exc:  # a bad demo must not kill the campaign
                     print(f"  {task} trial {trial}: ERROR {type(exc).__name__}: {exc}", flush=True)

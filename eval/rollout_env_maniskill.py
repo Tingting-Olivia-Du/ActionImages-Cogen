@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -62,7 +62,7 @@ class ManiSkillRolloutEnv:
 
     def __init__(self, task_dir: str, tree_root: str, resolution: int = 512,
                  anchor_modality: str = "video", control_mode: str = "pd_ee_pose",
-                 lazy_render: bool = True):
+                 lazy_render: bool = True, extra_renders: Sequence[str] = ()):
         self.task_dir = task_dir
         self.tree_root = Path(tree_root)
         self.resolution = resolution
@@ -78,6 +78,10 @@ class ManiSkillRolloutEnv:
         # So the caller must pass lazy_render=True only when it will never call views_*;
         # eval/rollout_maniskill.py derives it from (gt_replay and not record_video).
         self.lazy_render = lazy_render
+        for m in extra_renders:
+            if m not in ("depth", "mask"):
+                raise ValueError(f"extra_renders takes 'depth'/'mask', got {m!r}")
+        self.extra_renders = tuple(extra_renders)
         self._env = None
         self._episode_root: Optional[Path] = None
         self._cam_mismatch = False
@@ -155,7 +159,13 @@ class ManiSkillRolloutEnv:
                     for i, c in enumerate(self._episode_cams)
                 ]
 
-        need_extra = self.anchor_modality in ("depth", "normal", "segmentation", "all")
+        # `extra_renders` decouples WHAT IS RENDERED from what the policy is anchored on, for
+        # the reason spelled out in eval/rollout_env.py: the sim-replay perception eval needs
+        # the simulator's own depth/mask at every executed step even when the policy runs on an
+        # RGB anchor (which the RGB-only arm has no alternative to). Adding a render never
+        # changes an existing campaign's observations.
+        need_extra = (self.anchor_modality in ("depth", "normal", "segmentation", "all")
+                      or bool(self.extra_renders))
         obs_mode = "rgb+depth+segmentation" if need_extra else "rgb"
         env = MultiCamEnv(
             obs_mode="none" if self.lazy_render else obs_mode,

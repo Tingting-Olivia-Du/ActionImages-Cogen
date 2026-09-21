@@ -27,7 +27,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -117,6 +117,7 @@ class RolloutEnv:
         wrist_camera: bool = False,
         arm_action_mode: str = "ik",
         anchor_modality: str = "video",
+        extra_renders: Sequence[str] = (),
     ) -> None:
         """`arm_action_mode` is "ik" or "planning".
 
@@ -145,6 +146,20 @@ class RolloutEnv:
         # the handle map is needed only by `segmentation`.
         self._need_depth = anchor_modality in ("depth", "normal", "all")
         self._need_mask = anchor_modality in ("segmentation", "all")
+        # `extra_renders` DECOUPLES what the simulator renders from what the policy is anchored
+        # on. The two were the same thing as long as a render existed only to build the next
+        # anchor. The sim-replay perception eval breaks that: it needs the simulator's OWN
+        # depth/mask at every executed step as the counterfactual ground truth for whatever the
+        # model imagined -- and for the RGB-only arm, which HAS no depth+action template and so
+        # must run anchor_modality="video", there is no anchor that would turn the depth render
+        # on. Without this the arm0 half of that comparison is simply unmeasurable.
+        # It only ever ADDS renders, so every existing campaign's camera config is byte-identical.
+        for m in extra_renders:
+            if m not in ("depth", "mask"):
+                raise ValueError(f"extra_renders takes 'depth'/'mask', got {m!r}")
+        self._need_depth = self._need_depth or ("depth" in extra_renders)
+        self._need_mask = self._need_mask or ("mask" in extra_renders)
+        self.extra_renders = tuple(extra_renders)
         if arm_action_mode not in ("ik", "planning"):
             raise ValueError(f"arm_action_mode must be 'ik' or 'planning', got {arm_action_mode!r}")
         self.resolution = resolution

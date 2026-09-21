@@ -1,0 +1,76 @@
+block,task,gt_success,gt_n,harness_floor,model,success,n,rate_pct
+"RLBench, 14 never-trained tasks (clean domain)",close_box,20,20,False,official,5,20,25.0
+"RLBench, 14 never-trained tasks (clean domain)",close_box,20,20,False,arm0_6k,5,20,25.0
+"RLBench, 14 never-trained tasks (clean domain)",close_box,20,20,False,arm7_6k,5,20,25.0
+"RLBench, 14 never-trained tasks (clean domain)",close_box,20,20,False,arm0_4k,1,20,5.0
+"RLBench, 14 never-trained tasks (clean domain)",close_box,20,20,False,arm7_4k,6,20,30.0
+"RLBench, 14 never-trained tasks (clean domain)",close_drawer,20,20,False,official,16,20,80.0
+"RLBench, 14 never-trained tasks (clean domain)",close_drawer,20,20,False,arm0_6k,20,20,100.0
+"RLBench, 14 never-trained tasks (clean domain)",close_drawer,20,20,False,arm7_6k,18,20,90.0
+"RLBench, 14 never-trained tasks (clean domain)",close_drawer,20,20,False,arm0_4k,19,20,95.0
+"RLBench, 14 never-trained tasks (clean domain)",close_drawer,20,20,False,arm7_4k,11,20,55.0
+"RLBench, 14 never-trained tasks (clean domain)",close_microwave,20,20,False,official,15,20,75.0
+"RLBench, 14 never-trained tasks (clean domain)",close_microwave,20,20,False,arm0_6k,16,20,80.0
+"RLBench, 14 never-trained tasks (clean domain)",close_microwave,20,20,False,arm7_6k,13,20,65.0
+"RLBench, 14 never-trained tasks (clean domain)",close_microwave,20,20,False,arm0_4k,9,20,45.0
+"RLBench, 14 never-trained tasks (clean domain)",close_microwave,20,20,False,arm7_4k,17,20,85.0
+"RLBench, 14 never-trained tasks (clean domain)",take_lid_off_saucepan,20,20,False,official,16,20,80.0
+"RLBench, 14 never-trained tasks (clean domain)",take_lid_off_saucepan,20,20,False,arm0_6k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",take_lid_off_saucepan,20,20,False,arm7_6k,8,20,40.0
+"RLBench, 14 never-trained tasks (clean domain)",take_lid_off_saucepan,20,20,False,arm0_4k,17,20,85.0
+"RLBench, 14 never-trained tasks (clean domain)",take_lid_off_saucepan,20,20,False,arm7_4k,4,20,20.0
+"RLBench, 14 never-trained tasks (clean domain)",toilet_seat_down,20,20,False,official,3,20,15.0
+"RLBench, 14 never-trained tasks (clean domain)",toilet_seat_down,20,20,False,arm0_6k,4,20,20.0
+"RLBench, 14 never-trained tasks (clean domain)",toilet_seat_down,20,20,False,arm7_6k,6,20,30.0
+"RLBench, 14 never-trained tasks (clean domain)",toilet_seat_down,20,20,False,arm0_4k,7,20,35.0
+"RLBench, 14 never-trained tasks (clean domain)",toilet_seat_down,20,20,False,arm7_4k,7,20,35.0
+"RLBench, 14 never-trained tasks (clean domain)",basketball_in_hoop,19,20,False,official,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",basketball_in_hoop,19,20,False,arm0_6k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",basketball_in_hoop,19,20,False,arm7_6k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",basketball_in_hoop,19,20,False,arm0_4k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",basketball_in_hoop,19,20,False,arm7_4k,1,20,5.0
+"RLBench, 14 never-trained tasks (clean domain)",meat_on_grill,20,20,False,official,3,20,15.0
+"RLBench, 14 never-trained tasks (clean domain)",meat_on_grill,20,20,False,arm0_6k,3,20,15.0
+"RLBench, 14 never-trained tasks (clean domain)",meat_on_grill,20,20,False,arm7_6k,2,20,10.0
+"RLBench, 14 never-trained tasks (clean domain)",meat_on_grill,20,20,False,arm0_4k,4,20,20.0
+"RLBench, 14 never-trained tasks (clean domain)",meat_on_grill,20,20,False,arm7_4k,12,20,60.0
+"RLBench, 14 never-trained tasks (clean domain)",light_bulb_out,20,20,False,official,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",light_bulb_out,20,20,False,arm0_6k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",light_bulb_out,20,20,False,arm7_6k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",light_bulb_out,20,20,False,arm0_4k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",light_bulb_out,20,20,False,arm7_4k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",take_item_out_of_drawer,20,20,False,official,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",take_item_out_of_drawer,20,20,False,arm7_6k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",take_item_out_of_drawer,20,20,False,arm0_4k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",take_item_out_of_drawer,20,20,False,arm7_4k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",take_money_out_safe,19,20,False,official,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",take_money_out_safe,19,20,False,arm0_6k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",take_money_out_safe,19,20,False,arm7_6k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",take_money_out_safe,19,20,False,arm0_4k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",take_money_out_safe,19,20,False,arm7_4k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",put_rubbish_in_bin,20,20,False,official,1,20,5.0
+"RLBench, 14 never-trained tasks (clean domain)",put_rubbish_in_bin,20,20,False,arm0_6k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",put_rubbish_in_bin,20,20,False,arm7_6k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",put_rubbish_in_bin,20,20,False,arm0_4k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",put_rubbish_in_bin,20,20,False,arm7_4k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",stack_cups,19,20,False,official,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",stack_cups,19,20,False,arm7_6k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",stack_cups,19,20,False,arm0_4k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",stack_cups,19,20,False,arm7_4k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",open_window,20,20,False,official,1,20,5.0
+"RLBench, 14 never-trained tasks (clean domain)",open_window,20,20,False,arm0_6k,1,16,6.2
+"RLBench, 14 never-trained tasks (clean domain)",open_window,20,20,False,arm7_6k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",open_window,20,20,False,arm0_4k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",open_window,20,20,False,arm7_4k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",wipe_desk,14,20,False,official,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",wipe_desk,14,20,False,arm7_6k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",wipe_desk,14,20,False,arm0_4k,0,20,0.0
+"RLBench, 14 never-trained tasks (clean domain)",wipe_desk,14,20,False,arm7_4k,0,20,0.0
+"ManiSkill3, held-out TASKS",pull_cube,20,20,False,arm0_4k,2,8,25.0
+"ManiSkill3, held-out TASKS",pull_cube,20,20,False,arm7_4k,1,6,16.7
+"ManiSkill3, held-out TASKS",place_sphere,20,20,False,arm0_4k,0,4,0.0
+"ManiSkill3, held-out TASKS",place_sphere,20,20,False,arm7_4k,0,4,0.0
+"ManiSkill3, trained tasks / held-out seeds (variation1)",pick_cube,20,20,False,arm7_4k,0,9,0.0
+"ManiSkill3, trained tasks / held-out seeds (variation1)",stack_cube,20,20,False,arm7_4k,0,6,0.0
+"ManiSkill3, trained tasks / held-out seeds (variation1)",pull_cube_tool,20,20,False,arm7_4k,0,2,0.0
+"ManiSkill3, trained tasks / held-out seeds (variation1)",push_cube,20,20,False,arm7_4k,2,8,25.0
