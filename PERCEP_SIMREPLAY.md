@@ -228,7 +228,7 @@ arm4 V+D+S   arm5 V+N+S   arm6 V+D+N   arm7 V+D+N+S (XGenAct)
 ```latex
 \begin{tabular}{@{}llccccccc@{}}
 \textbf{Arm (training outputs)} & \textbf{Prediction route}
-  & Close microwave & Toilet seat down & Close box & Meat on grill & RL avg.
+  & Close microwave & Toilet seat down & Close box & close drawer & Meat on grill & RL avg.
   & Pull cube & All avg. \\
 \midrule
 \multicolumn{9}{@{}l}{\textbf{Future RGB} --- LPIPS $\downarrow$} \\
