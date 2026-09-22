@@ -217,6 +217,23 @@ def main():
     out_path = os.path.join(args.out, f"rollout_{args.tag}.json")
     results: List[Dict] = []
     errors: List[Dict] = []
+    # RESUME. Without it a 10-trial look could only become a 20-trial result by throwing the
+    # first 10 away. Trials already scored under THIS tag are kept and skipped -- but only if
+    # the protocol is the one they were scored under; mixing two protocols in one file would
+    # make every aggregate over it meaningless.
+    done = set()
+    if os.path.exists(out_path):
+        prev = json.load(open(out_path))
+        keys = ("ckpt", "tree", "variation", "cfg", "steps", "frame_interval", "prompt_tag_style",
+                "skip_anchor_frames", "max_ik_fail_streak", "max_steps_factor", "seed",
+                "execution_horizon", "axis_solver", "res")
+        diff = {k: (prev.get("args", {}).get(k), getattr(args, k)) for k in keys
+                if prev.get("args", {}).get(k) != getattr(args, k)}
+        if diff:
+            raise SystemExit(f"refusing to resume {out_path}: protocol differs {diff}")
+        results = prev.get("results", [])
+        done = {(r["task"], r["trial"]) for r in results}
+        print(f"resuming {out_path}: {len(results)} trials already scored", flush=True)
 
     for task in args.tasks:
         # lazy_render skips rendering entirely, so it is safe ONLY when nothing will ask
@@ -226,6 +243,8 @@ def main():
             eps = env.episode_dirs(args.variation)[: args.num_trials]
             print(f"env up; task={task} episodes={len(eps)} gt_replay={args.gt_replay}", flush=True)
             for trial, ed in enumerate(eps):
+                if (task, trial) in done:
+                    continue
                 try:
                     r = rollout_one(
                         env, policy, task, ed, trial,

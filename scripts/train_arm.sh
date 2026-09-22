@@ -72,7 +72,11 @@ if [ -z "${WANDB_API_KEY:-}" ] && [ -f "$TTD_ENV" ]; then
   WANDB_ENTITY_FROM_ENV="$(sed -n 's/^WANDB_ENTITY=//p' "$TTD_ENV" | tr -d '"'"'"' \r')"
   [ -n "$WANDB_ENTITY_FROM_ENV" ] && export WANDB_ENTITY="${WANDB_ENTITY:-$WANDB_ENTITY_FROM_ENV}"
 fi
-if [ -z "${WANDB_API_KEY:-}" ]; then
+# No key is needed when nothing will be uploaded: `--report_to none` in EXTRA_ARGS (which the
+# message below has always promised, but the check did not honour until 2026-09-22), or
+# WANDB_MODE=offline / disabled, where wandb.init writes a local run to sync later.
+if [ -z "${WANDB_API_KEY:-}" ] && [[ "${EXTRA_ARGS:-}" != *"--report_to none"* ]] \
+   && [ "${WANDB_MODE:-}" != offline ] && [ "${WANDB_MODE:-}" != disabled ]; then
   echo "!! no WANDB_API_KEY (looked in \$WANDB_API_KEY and $TTD_ENV:WANDB_API)."
   echo "   Either export it, or add EXTRA_ARGS='--report_to none' to run without logging."
   exit 4

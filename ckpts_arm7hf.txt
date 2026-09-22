@@ -1,0 +1,1 @@
+arm7 /workspace/1228_tingting/ActionImages-Cogen/checkpoints/arm7/checkpoint-4000/step4000.ckpt
