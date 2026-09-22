@@ -5,33 +5,38 @@
 #   bash scripts/run_single_source_eval.sh models   # the six checkpoints, one GPU per job
 #   DRY_RUN=1 bash scripts/run_single_source_eval.sh models   # print the queue and exit
 #
-# Each model is scored in ITS OWN simulator (an rlbench-only run on RLBench, a maniskill-only run
-# on ManiSkill), 20 trials per task, with exactly the protocol of the origin machine's campaigns:
-#   RLBench    close_box close_drawer close_microwave toilet_seat_down meat_on_grill
-#              (all absent from the RLBench training tree; scenes generated live, no data needed)
-#   ManiSkill  unseen TASKS first:  pull_cube place_sphere lift_peg_upright   (maniskill3_heldout, var 0)
-#              then seen tasks at NEW SEEDS: pick_cube stack_cube push_cube pull_cube_tool
-#                                                                       (maniskill3, variation 1)
+# Each model is scored in ITS OWN simulator (an rlbench-only run on RLBench, a libero-only run
+# on LIBERO), 20 trials per task.
+#   RLBench  close_box close_drawer close_microwave toilet_seat_down meat_on_grill
+#            (all absent from the RLBench training tree; scenes generated live, no data needed)
+#   LIBERO   LIB_SPECS, "suite:task_index" pairs; default one task per suite (index 0).
+#            Trials are the benchmark's own FIXED init states 0..TRIALS-1, which are not the
+#            demonstrations' initial states -- the standard LIBERO protocol.
+#
+# LIBERO HAS NO CLOSED-LOOP HARNESS YET. The LIBERO branch calls eval/rollout_libero.py with the
+# CLI contract below; until that file exists it prints where to start and skips LIBERO, so the
+# RLBench half still runs. See the guide (separate_train_eval.md, Sec. 5.3) for the spec.
+#
 # Within a task the models alternate, so the paired comparison fills in together. The scene of
 # (task, trial) is identical for every model -- RLBench seeds it from blake2b(task|var|trial),
-# ManiSkill replays stored episode `trial` -- which is what licenses a paired McNemar test.
+# LIBERO loads fixed init state `trial` -- which is what licenses a paired McNemar test.
 set -uo pipefail
 MODE="${1:?gt|models}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO" || exit 2
 [ -n "${ENV_RC:-}" ] && source "$ENV_RC"
 unset CUDA_VISIBLE_DEVICES
-if [ -z "${VK_ICD_FILENAMES:-}" ]; then
-  icd=$(python -c "import sapien,os;print(os.path.join(os.path.dirname(sapien.__file__),'vulkan_library','nvidia_icd.json'))" 2>/dev/null)
-  [ -f "$icd" ] && export VK_ICD_FILENAMES="$icd"
-fi
-TRIALS="${TRIALS:-20}"; STEP="${STEP:-4000}"; GPUS="${GPUS:-0 1 2 3 4 5 6 7}"
-ARMS="${ARMS:-arm1 arm2 arm3}"; SOURCES="${SOURCES:-rlbench maniskill}"
+export MUJOCO_GL="${MUJOCO_GL:-egl}"   # LIBERO offscreen rendering
+TRIALS="${TRIALS:-20}"
+# RLBench runs stop at 4k. LIBERO runs go to 10k; evaluate the step the held-out validation
+# picked (scripts/run_libero_val.sh), the SAME step for all three arms.
+RLB_STEP="${RLB_STEP:-4000}"; LIB_STEP="${LIB_STEP:-10000}"; GPUS="${GPUS:-0 1 2 3 4 5 6 7}"
+ARMS="${ARMS:-arm1 arm2 arm3}"; SOURCES="${SOURCES:-rlbench libero}"
 OUT="$REPO/reports/closedloop_single_source"; LOGS="$REPO/logs/logs_single_source_eval"
 mkdir -p "$OUT" "$LOGS"
 RLB_TASKS="close_box close_drawer close_microwave toilet_seat_down meat_on_grill"
-MS_SPECS="heldout:pull_cube heldout:place_sphere heldout:lift_peg_upright \
-seeds:pick_cube seeds:stack_cube seeds:push_cube seeds:pull_cube_tool"
+LIB_SPECS="${LIB_SPECS:-libero_spatial:0 libero_object:0 libero_goal:0 libero_10:0}"
+HAVE_LIBERO_HARNESS=0; [ -f eval/rollout_libero.py ] && HAVE_LIBERO_HARNESS=1
 
 rlb_cmd() {  # rlb_cmd <tag> <task> [--ckpt X | --gt-replay]
   local tag=$1 task=$2; shift 2
@@ -41,15 +46,17 @@ rlb_cmd() {  # rlb_cmd <tag> <task> [--ckpt X | --gt-replay]
     --max-steps-factor 1.5 --skip-anchor-frames 4 --execution-horizon 41 \
     --max-ik-fail-streak 5 --anchor-modality video --seed 42 --out "$OUT"
 }
-ms_cmd() {   # ms_cmd <tag> <blk> <task> [--ckpt X | --gt-replay]
-  local tag=$1 blk=$2 task=$3 tree var; shift 3
-  if [ "$blk" = heldout ]; then tree="$REPO/data/maniskill3_heldout"; var=0
-  else tree="$REPO/data/maniskill3"; var=1; fi
-  python -u eval/rollout_maniskill.py "$@" --tag "$tag" --tasks "$task" --tree "$tree" \
-    --variation "$var" --num-trials "$TRIALS" --res 512 --cfg 7.5 --steps 50 \
-    --frame-interval 1 --prompt-tag-style explicit --axis-solver sphere \
-    --max-steps-factor 1.5 --skip-anchor-frames 4 --execution-horizon 41 \
-    --max-ik-fail-streak 5 --seed 42 --out "$OUT"
+lib_cmd() {  # lib_cmd <tag> <suite> <task_index> [--ckpt X | --gt-replay]
+  # CLI CONTRACT for eval/rollout_libero.py (to be written; mirror eval/rollout_maniskill.py).
+  local tag=$1 suite=$2 ti=$3; shift 3
+  python -u eval/rollout_libero.py "$@" --tag "$tag" --suite "$suite" --task-index "$ti" \
+    --num-trials "$TRIALS" --res 512 --cfg 7.5 --steps 50 --frame-interval 1 \
+    --prompt-tag-style explicit --axis-solver sphere --skip-anchor-frames 4 \
+    --execution-horizon 41 --max-ik-fail-streak 5 --seed 42 --out "$OUT"
+}
+no_harness() {
+  echo "!! eval/rollout_libero.py does not exist yet -- skipping LIBERO. Write it to the spec in"
+  echo "   separate_train_eval.md Sec. 5.3 (start from eval/rollout_maniskill.py + scripts/libero_gen.py)."
 }
 complete() { python "$REPO/scripts/cl_json_complete.py" "$OUT/rollout_$1.json" "$TRIALS"; }
 
@@ -62,33 +69,37 @@ if [ "$MODE" = gt ]; then
     rlb_cmd "ssgt_rlbench_$t" "$t" --gt-replay --no-record-video > "$LOGS/ssgt_rlbench_$t.log" 2>&1 &
     sleep 2
   done
-  for spec in $MS_SPECS; do
-    blk=${spec%%:*}; t=${spec##*:}; complete "ssgt_maniskill_$t" && continue
-    CUDA_VISIBLE_DEVICES="${GPUS%% *}" ms_cmd "ssgt_maniskill_$t" "$blk" "$t" --gt-replay \
-      --no-record-video > "$LOGS/ssgt_maniskill_$t.log" 2>&1
-  done
+  if [ "$HAVE_LIBERO_HARNESS" = 1 ]; then
+    for spec in $LIB_SPECS; do
+      su=${spec%%:*}; ti=${spec##*:}; complete "ssgt_libero_${su}_t$ti" && continue
+      # GT replay on LIBERO replays the tree's own recorded TCP poses through the same absolute
+      # controller the model drives -- it validates the controller conventions (Sec. 5.3).
+      CUDA_VISIBLE_DEVICES="${GPUS%% *}" lib_cmd "ssgt_libero_${su}_t$ti" "$su" "$ti" --gt-replay \
+        --tree "$REPO/data/$su" --no-record-video > "$LOGS/ssgt_libero_${su}_t$ti.log" 2>&1
+    done
+  else no_harness; fi
   wait; echo "GT_DONE"; exit 0
 fi
 
 # ---- models: build the queue
-QUEUE="$LOGS/queue_${STEP}.txt"; IDX="$LOGS/queue_${STEP}.idx"
+QUEUE="$LOGS/queue_r${RLB_STEP}_l${LIB_STEP}.txt"; IDX="$LOGS/queue_r${RLB_STEP}_l${LIB_STEP}.idx"
 if [ "${FRESH_QUEUE:-1}" = 1 ]; then
   : > "$QUEUE"
-  rl=($RLB_TASKS); ms=($MS_SPECS); n=$(( ${#rl[@]} > ${#ms[@]} ? ${#rl[@]} : ${#ms[@]} ))
+  rl=($RLB_TASKS); lb=($LIB_SPECS); n=$(( ${#rl[@]} > ${#lb[@]} ? ${#rl[@]} : ${#lb[@]} ))
   for ((i = 0; i < n; i++)); do
     for src in $SOURCES; do
       if [ "$src" = rlbench ] && [ $i -lt ${#rl[@]} ]; then
         for a in $ARMS; do echo "$a rlbench - ${rl[$i]}" >> "$QUEUE"; done
-      elif [ "$src" = maniskill ] && [ $i -lt ${#ms[@]} ]; then
-        for a in $ARMS; do echo "$a maniskill ${ms[$i]%%:*} ${ms[$i]##*:}" >> "$QUEUE"; done
+      elif [ "$src" = libero ] && [ $i -lt ${#lb[@]} ]; then
+        for a in $ARMS; do echo "$a libero ${lb[$i]%%:*} ${lb[$i]##*:}" >> "$QUEUE"; done
       fi
     done
   done
   echo 0 > "$IDX"
 fi
 TOTAL=$(wc -l < "$QUEUE")
-if [ "${DRY_RUN:-0}" = 1 ]; then nl "$QUEUE"; echo "($TOTAL jobs x $TRIALS trials, step $STEP)"; exit 0; fi
-echo "[single-source eval] $TOTAL jobs x $TRIALS trials, step $STEP, GPUs: $GPUS -> $OUT"
+if [ "${DRY_RUN:-0}" = 1 ]; then nl "$QUEUE"; echo "($TOTAL jobs x $TRIALS trials, RLBench step $RLB_STEP, LIBERO step $LIB_STEP)"; exit 0; fi
+echo "[single-source eval] $TOTAL jobs x $TRIALS trials, RLBench step $RLB_STEP, LIBERO step $LIB_STEP, GPUs: $GPUS -> $OUT"
 
 next_job() {
   local k; exec 9>"$LOGS/.lock"; flock 9
@@ -99,15 +110,22 @@ worker() {
   local gpu=$1 job a src blk t tag ck
   while job=$(next_job); do
     read -r a src blk t <<< "$job"
-    tag="ss_${a}_${src}_$((STEP / 1000))k_${t}"
+    if [ "$src" = libero ]; then
+      st=$LIB_STEP; run="${a}_liberoonly_fromofficial_a1_10k"
+      tag="ss_${a}_libero_$((st / 1000))k_${blk}_t${t}"
+      [ "$HAVE_LIBERO_HARNESS" = 1 ] || { echo "[gpu$gpu] skip $tag (no LIBERO harness)"; continue; }
+    else
+      st=$RLB_STEP; run="${a}_rlbenchonly_fromofficial_a1_4k"
+      tag="ss_${a}_${src}_$((st / 1000))k_${t}"
+    fi
     complete "$tag" && { echo "[gpu$gpu] skip $tag (complete)"; continue; }
-    ck="$REPO/outputs/${a}_${src}only_fromofficial_a1_4k/checkpoint-${STEP}/step${STEP}.ckpt"
+    ck="$REPO/outputs/$run/checkpoint-${st}/step${st}.ckpt"
     [ -f "$ck" ] || { echo "[gpu$gpu] MISSING $ck -- skipping $tag"; continue; }
     echo "[gpu$gpu] $(date +%H:%M:%S) start $tag"
     if [ "$src" = rlbench ]; then
       CUDA_VISIBLE_DEVICES="$gpu" rlb_cmd "$tag" "$t" --ckpt "$ck" --record-video >> "$LOGS/$tag.log" 2>&1
     else
-      CUDA_VISIBLE_DEVICES="$gpu" ms_cmd "$tag" "$blk" "$t" --ckpt "$ck" --record-video >> "$LOGS/$tag.log" 2>&1
+      CUDA_VISIBLE_DEVICES="$gpu" lib_cmd "$tag" "$blk" "$t" --ckpt "$ck" --record-video >> "$LOGS/$tag.log" 2>&1
     fi
     echo "[gpu$gpu] $(date +%H:%M:%S) done  $tag rc=$?"
   done

@@ -556,6 +556,28 @@ class CombDataset(torch.utils.data.Dataset):
                 variations=variations,
                 segmentation_mode=segmentation_mode,
             ),
+            # FORK: LIBERO -- the four standard suites' official demonstrations, replayed from
+            # their MuJoCo states into the selfgen layout by scripts/libero_gen.py (4 randomized
+            # 512 cameras per episode, 55 deg FOV, full five-modality GT, BDDL-derived scene
+            # roles). One tree per suite, so a run can weight the suites or pick one.
+            # frame_interval is PINNED to 1 for the source-property reason given for maniskill3:
+            # measured on the rendered trees, a stride-3 window (121 frames) is longer than 44%
+            # of libero_spatial and 56% of libero_goal episodes (medians 124 and 110 frames), which
+            # would turn them into freeze-frame tails; at 1 a 41-frame window always fits (the
+            # shortest episode is 85). variation0 = 45 train demos per task, variation1 = 5 held out.
+            **{suite: (lambda suite=suite: RLBenchSelfgenDataset(
+                base_path=os.path.join(dataset_path, suite),
+                num_frames=num_frames,
+                frame_interval=1,
+                height=height,
+                width=width,
+                template_mix=mix_for(suite),
+                prompt_tag_style=prompt_tag_style,
+                action_dropout_prob=action_dropout_prob,
+                strict_getitem=strict_getitem,
+                variations=variations,
+                segmentation_mode=segmentation_mode,
+            )) for suite in ("libero_spatial", "libero_object", "libero_goal", "libero_10")},
         }
 
         datasets: List[torch.utils.data.Dataset] = []

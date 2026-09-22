@@ -192,7 +192,10 @@ def evaluate(pipe, ds, idx, args, out_dir):
     rel = np.matmul(np.transpose(Rot.from_quat(pose8[:, 3:7]).as_matrix(), (0, 2, 1)), gt_rot)
     rot_err = np.degrees(np.arccos(np.clip((np.trace(rel, axis1=1, axis2=2) - 1) / 2, -1, 1)))
 
-    gt_open = gt_a7[:, 6]
+    # Binarise the GT too: RLBench's gripper_open is exactly 0/1, but LIBERO and ManiSkill store a
+    # continuous openness (0.97 open, <=0.33 closed on LIBERO), and comparing that with `==` against
+    # a binary prediction scored every frame wrong. Identical to the old behaviour on 0/1 labels.
+    gt_open = (gt_a7[:, 6] > 0.5).astype(float)
     pred_open = (pose8[:, 7] > 0.5).astype(float)
 
     def med(x, mask):
